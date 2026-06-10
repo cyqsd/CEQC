@@ -1,0 +1,22 @@
+
+# ignore dir
+#build/
+build/*.txt
+build/Makefile
+build/*.cmake
+build/CMakeFiles
+build/sdk_core
+build/sample
+
+#whitelist
+!build/notes.txt
+
+bin
+
+#output/
+pcd_output
+
+*.obj
+*.exe
+*.pcap
+.idea

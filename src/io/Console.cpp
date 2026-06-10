@@ -68,6 +68,13 @@ int prnNumber(const std::string& sat) {
   try { return std::stoi(sat.substr(1)); } catch (...) { return 0; }
 }
 
+
+std::string histogramText(const std::vector<int>& h){
+  std::ostringstream os; os << "[";
+  for(size_t i=0;i<h.size();++i){ if(i) os << ","; os << h[i]; }
+  os << "]"; return os.str();
+}
+
 double sampleStdDev(const ceqc::model::QCMetricStats& st) {
   if (st.count < 2) return 0.0;
   double sum2 = st.rms * st.rms * st.count;
@@ -318,7 +325,7 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
   }
   if (s.derived && s.derived->mp1Meters > 0) os << "Moving average MP12     : " << std::fixed << std::setprecision(6) << s.derived->mp1Meters << " m\n";
   if (s.derived && s.derived->mp2Meters > 0) os << "Moving average MP21     : " << std::fixed << std::setprecision(6) << s.derived->mp2Meters << " m\n";
-  if (s.derived) {
+  if (s.derived && s.derived->multipathEnabled) {
     std::vector<std::pair<std::string,double>> mps(s.derived->multipathMovingRMS.begin(), s.derived->multipathMovingRMS.end());
     std::sort(mps.begin(), mps.end(), [](const auto& a,const auto& b){ return a.first < b.first; });
     if(!mps.empty()) {
@@ -339,8 +346,8 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
          << " " << mpQuality(kv.second) << "\n";
     }
   }
-  os << "Points in MP moving avg : 50\n";
-  if (s.derived) {
+  if (s.derived && s.derived->multipathEnabled) os << "Points in MP moving avg : 50\n";
+  if (s.derived && s.derived->snrEnabled) {
     for (std::string band : {"1","2","5","6","7","8"}) {
       auto it = s.derived->snrStats.find(band);
       if (it == s.derived->snrStats.end() || it->second.count == 0) continue;
@@ -357,6 +364,7 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
   os << "       but < than       : 90.00 minute(s)\n";
   os << "epochs w/ msec clk slip : 0\n";
   os << "other msec mp events    : 0 (: " << (s.derived ? s.derived->msecMpEventBins : 0) << ")   {expect ~= 1:50}\n";
+  if (s.derived && s.derived->iodEnabled) {
   os << "IOD signifying a slip   : >400.0 cm/minute\n";
   if (s.derived && (s.derived->iodSlipsAboveMask || s.derived->iodOrMPSlipsAboveMask || s.derived->maskedObsBelowMask)) {
     os << "IOD slips <  10.0 deg*  : " << std::setw(6) << s.derived->iodSlipsBelowMask << "\n";
@@ -367,6 +375,26 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
   } else {
     os << "IOD slips               :      0\n";
     os << "IOD or MP slips         :      0\n";
+  }
+  }
+  if (s.derived) {
+    auto printComputedTeqc=[&](const std::string& label,const std::string& key,int samplesOverride=-1){ int samples=samplesOverride>=0?samplesOverride:(s.derived->histogramSamples.count(key)?s.derived->histogramSamples.at(key):0); auto hit=s.derived->histograms.find(key); if(samples<=0 || hit==s.derived->histograms.end()) os << label << " skipped             : samples=0\n"; else os << label << " computed            : samples=" << samples << " bins=" << histogramText(hit->second) << "\n"; };
+    printComputedTeqc("ION","ion");
+    int mp1Samples=0, mp2Samples=0; auto m1=s.derived->multipathMovingCount.find("MP1"); if(m1!=s.derived->multipathMovingCount.end()) mp1Samples=m1->second; auto m2=s.derived->multipathMovingCount.find("MP2"); if(m2!=s.derived->multipathMovingCount.end()) mp2Samples=m2->second;
+    if(mp1Samples>0) os << "MP1 computed            : samples=" << mp1Samples << " rms_m=" << std::fixed << std::setprecision(3) << s.derived->mp1Meters << "\n"; else os << "MP1 skipped             : samples=0\n";
+    if(mp2Samples>0) os << "MP2 computed            : samples=" << mp2Samples << " rms_m=" << std::fixed << std::setprecision(3) << s.derived->mp2Meters << "\n"; else os << "MP2 skipped             : samples=0\n";
+    if(s.derived->ceqcExtensionEnabled || s.derived->dataIndicatorsEnabled){ for(const auto& kv:s.derived->histogramSamples){ if(kv.first=="ion"||kv.first=="mp") continue; if(s.derived->histograms.find(kv.first)==s.derived->histograms.end()) os << "CEQC-ext histogram " << kv.first << " : skipped samples=" << kv.second << "\n"; } for(const auto& kv:s.derived->histograms){ if(kv.first=="ion"||kv.first=="mp") continue; os << "CEQC-ext histogram " << kv.first << " : " << histogramText(kv.second) << " samples=" << (s.derived->histogramSamples.count(kv.first)?s.derived->histogramSamples.at(kv.first):0) << "\n"; } }
+    for(const auto& w:s.derived->thresholdWarnings) os << "QC threshold warning    : " << w << "\n";
+    if((s.derived->everyEpochXYZ||s.derived->everyEpochGeodetic||s.derived->everyEpochDecimal) && !s.derived->epochPositions.empty()){
+      os << "Every-epoch position    : " << s.derived->epochPositions.size() << " epoch records\n";
+      size_t shown=0;
+      for(const auto& ep:s.derived->epochPositions){
+        if(shown++>=20){ os << "  ... truncated ...\n"; break; }
+        os << "  " << ep.time << " SV=" << ep.usedSVs << " " << ep.status;
+        if(ep.status=="OK") os << " XYZ=" << std::fixed << std::setprecision(3) << ep.x << "," << ep.y << "," << ep.z;
+        os << "\n";
+      }
+    }
   }
   if (s.ubx) os << "SFRBX messages          : " << std::setw(6) << s.ubx->sfrbxCount << "\n";
   if (s.firstEpoch && s.lastEpoch) {
@@ -397,12 +425,76 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
 } // namespace
 
 namespace ceqc::view {
-void printVersion(std::ostream& os){ os << "ceqc 0.0.1 C++21-cleanroom\n"; }
+void printVersion(std::ostream& os){ os << "ceqc 5.37.0 C++21-cleanroom\n"; }
 void printHelp(std::ostream& os){ os << ceqcHelpText(); }
 void printIssues(std::ostream& os,const std::string& path,const std::vector<ceqc::model::ValidationIssue>& issues){ if(issues.empty()){os<<path<<": OK\n";return;} for(auto&i:issues)os<<path<<": "<<i.severity<<": "<<i.message<<"\n"; }
 void printQC(std::ostream& os,const ceqc::model::QCSummary& s,bool quiet,bool teqcCompat){ if(teqcCompat){ printTeqcLikeQC(os,s); return; } os<<"file: "<<s.sourcePath<<"\n"<<"rinex: "<<std::fixed<<std::setprecision(2)<<s.version<<" "<<toString(s.kind)<<"\n"; os<<"epochs: "<<s.epochCount<<"\n"; if(s.kind==ceqc::model::RinexKind::Obs){ os<<"obs-records: "<<s.observationRecords<<"\n"; os<<"obs-values: decoded="<<s.observationValues<<" missing="<<s.missingObservations<<"\n"; } if(s.kind==ceqc::model::RinexKind::Nav){ os<<"nav-records: "<<s.navigationRecords<<"\nnav-values: "<<s.navigationValues<<"\nnav-fields: "<<s.navigationFields<<"\n"; } if(s.firstEpoch) os<<"first: "<<ceqc::model::formatUTC(*s.firstEpoch)<<"\n"; if(s.lastEpoch) os<<"last: "<<ceqc::model::formatUTC(*s.lastEpoch)<<"\n"; if(s.estimatedIntervalS>0) os<<"interval: "<<std::setprecision(3)<<s.estimatedIntervalS<<"s\n"; if(!quiet){ os<<"systems:\n"; for(auto&kv:s.systemAppearance)os<<"  "<<kv.first<<": "<<kv.second<<"\n"; }
-  if(s.derived){ os<<"qc-options:"; for(auto&o:s.derived->optionsActive)os<<" "<<o; os<<"\n"; os<<"epoch-svs: min="<<s.derived->epochSVMin<<" mean="<<std::setprecision(2)<<s.derived->epochSVMean<<" max="<<s.derived->epochSVMax<<"\n"; if(!s.derived->gapEvents.empty()) os<<"gaps: "<<s.derived->gapEvents.size()<<"\n"; os<<"lli-count: "<<s.derived->lliCount<<"\n"; if(!s.derived->snrStats.empty()) for(auto&kv:s.derived->snrStats) os<<"snr-summary "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(2)<<kv.second.mean<<" rms="<<kv.second.rms<<" low="<<kv.second.lowCount<<"\n"; if(!s.derived->pseudorangePhase.empty()) for(auto&kv:s.derived->pseudorangePhase) os<<"pseudorange-phase "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(3)<<kv.second.mean<<" rms="<<kv.second.rms<<"\n"; os<<"qc-timeplot: "<<s.derived->timeplot<<"\n"; }
-  if(s.residuals){ os<<"residual-qc: candidates="<<s.residuals->candidateObservations<<" evaluated="<<s.residuals->evaluated<<" no_station="<<s.residuals->skippedNoStation<<" no_ephemeris="<<s.residuals->skippedNoEphemeris<<" no_pseudorange="<<s.residuals->skippedNoPseudorange<<"\n"; os<<"residual-meters: mean="<<s.residuals->meanMeters<<" rms="<<s.residuals->rmsMeters<<" max_abs="<<s.residuals->maxAbsMeters<<"\n"; for(auto& w:s.residuals->warnings) os<<"residual-warning: "<<w<<"\n"; }
+  if(s.derived){ os<<"qc-options:"; for(auto&o:s.derived->optionsActive)os<<" "<<o; os<<"\n"; os<<"epoch-svs: min="<<s.derived->epochSVMin<<" mean="<<std::setprecision(2)<<s.derived->epochSVMean<<" max="<<s.derived->epochSVMax<<"\n"; if(!s.derived->gapEvents.empty()) os<<"gaps: "<<s.derived->gapEvents.size()<<"\n"; if(s.derived->lliEnabled) os<<"lli-count: "<<s.derived->lliCount<<"\n"; if(s.derived->snrEnabled && !s.derived->snrStats.empty()){ bool anyCode=false; for(auto&kv:s.derived->snrStats) if(kv.first.find(':')!=std::string::npos){ anyCode=true; os<<"snr-summary "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(2)<<kv.second.mean<<" rms="<<kv.second.rms<<" low="<<kv.second.lowCount<<"\n"; } if(!anyCode) for(auto&kv:s.derived->snrStats) if(kv.first!="all") os<<"snr-summary "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(2)<<kv.second.mean<<" rms="<<kv.second.rms<<" low="<<kv.second.lowCount<<"\n"; } if(s.derived->pseudorangePhaseEnabled && !s.derived->pseudorangePhase.empty()) for(auto&kv:s.derived->pseudorangePhase) os<<"pseudorange-phase "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(3)<<kv.second.mean<<" rms="<<kv.second.rms<<"\n"; if(!s.derived->timeplot.empty()) os<<"qc-timeplot: "<<s.derived->timeplot<<"\n";
+    if(s.derived->ceqcExtensionEnabled && !s.derived->obsTimeplot.empty()) os<<"ceqc-ext timeplot obs: |"<<s.derived->obsTimeplot<<"|\n";
+    if(s.derived->ceqcExtensionEnabled && !s.derived->navTimeplot.empty()) os<<"ceqc-ext timeplot nav: |"<<s.derived->navTimeplot<<"|\n";
+    if(s.derived->ceqcExtensionEnabled && !s.derived->positionTimeplot.empty()) os<<"ceqc-ext timeplot position: |"<<s.derived->positionTimeplot<<"|\n";
+    auto printComputed=[&](const std::string& label,const std::string& key,int samplesOverride=-1){ int samples=samplesOverride>=0?samplesOverride:(s.derived->histogramSamples.count(key)?s.derived->histogramSamples.at(key):0); auto hit=s.derived->histograms.find(key); if(samples<=0 || hit==s.derived->histograms.end()) os<<label<<" skipped: samples=0\n"; else os<<label<<" computed: samples="<<samples<<" bins="<<histogramText(hit->second)<<"\n"; };
+    printComputed("ION","ion");
+    int mp1Samples=0, mp2Samples=0; auto m1=s.derived->multipathMovingCount.find("MP1"); if(m1!=s.derived->multipathMovingCount.end()) mp1Samples=m1->second; auto m2=s.derived->multipathMovingCount.find("MP2"); if(m2!=s.derived->multipathMovingCount.end()) mp2Samples=m2->second;
+    if(mp1Samples>0) os<<"MP1 computed: samples="<<mp1Samples<<" rms_m="<<std::fixed<<std::setprecision(3)<<s.derived->mp1Meters<<"\n"; else os<<"MP1 skipped: samples=0\n";
+    if(mp2Samples>0) os<<"MP2 computed: samples="<<mp2Samples<<" rms_m="<<std::fixed<<std::setprecision(3)<<s.derived->mp2Meters<<"\n"; else os<<"MP2 skipped: samples=0\n";
+    if(s.derived->ceqcExtensionEnabled || s.derived->dataIndicatorsEnabled){ for(const auto& kv:s.derived->histogramSamples){ if(kv.first=="ion"||kv.first=="mp") continue; if(s.derived->histograms.find(kv.first)==s.derived->histograms.end()) os<<"ceqc-ext histogram "<<kv.first<<": skipped samples="<<kv.second<<"\n"; } for(const auto& kv:s.derived->histograms){ if(kv.first=="ion"||kv.first=="mp") continue; os<<"ceqc-ext histogram "<<kv.first<<": "<<histogramText(kv.second)<<" samples="<<(s.derived->histogramSamples.count(kv.first)?s.derived->histogramSamples.at(kv.first):0)<<"\n"; } }
+    for(const auto& w:s.derived->thresholdWarnings) os<<"qc-threshold-warning: "<<w<<"\n";
+    if(s.derived->position.skippedNoNavigation){ os<<"position-qc: skipped=no_navigation candidate_epochs="<<s.derived->position.candidateEpochs<<" min_svs="<<s.derived->minSVsUsed<<"\n"; }
+    else if(s.derived->position.attempted) { os<<"position-qc: solved="<<s.derived->position.epochSolutions<<" skipped="<<(s.derived->position.candidateEpochs-s.derived->position.epochSolutions)<<" min_svs="<<s.derived->minSVsUsed<<"\n"; if(s.derived->ceqcExtensionEnabled){ os<<"ceqc-ext position-qc: candidate_epochs="<<s.derived->position.candidateEpochs<<" skipped_insufficient_svs="<<s.derived->position.skippedInsufficientSVs<<" max_epoch_used_svs_by_system"; for(const char* sys : {"G","R","E","C","J"}){ auto it=s.derived->position.usedSVsBySystem.find(sys); os<<" "<<sys<<"="<<(it==s.derived->position.usedSVsBySystem.end()?0:it->second); } os<<"\n"; } }
+    if((s.derived->everyEpochXYZ||s.derived->everyEpochGeodetic||s.derived->everyEpochDecimal) && !s.derived->epochPositions.empty()){
+      os<<"every-epoch-position:\n";
+      for(const auto& ep:s.derived->epochPositions){
+        os<<"  "<<ep.time<<" sv="<<ep.usedSVs<<" status="<<ep.status;
+        if(ep.status=="OK"){
+          if(s.derived->epochPositions.size()>200 && (&ep-&s.derived->epochPositions.front())>=200){ os<<" ... truncated\n"; break; }
+          if(s.derived->everyEpochXYZ || (!s.derived->everyEpochGeodetic && !s.derived->everyEpochDecimal)) os<<" xyz="<<std::fixed<<std::setprecision(4)<<ep.x<<","<<ep.y<<","<<ep.z;
+          if(s.derived->everyEpochGeodetic || s.derived->everyEpochDecimal) os<<" llh="<<std::setprecision(s.derived->everyEpochDecimal?9:6)<<ep.latDeg<<","<<ep.lonDeg<<","<<std::setprecision(4)<<ep.heightM;
+          os<<" clk_m="<<std::setprecision(4)<<ep.clockBiasM;
+        }
+        os<<"\n";
+      }
+    }
+    if(s.derived->dataIndicatorsEnabled){ os<<"data-completeness: complete="<<s.derived->dataCompleteness.completeRecords<<" partial="<<s.derived->dataCompleteness.partialRecords<<" missing_values="<<s.derived->dataCompleteness.missingValues<<"\n"; }
+    if(s.derived->yCodeEnabled){ os<<"y-code-summary: gps_y_code_observations="<<s.derived->dataCompleteness.yCodeObservations<<"\n"; }
+    if(s.derived->riseSetEnabled && !s.derived->riseSetEvents.empty()){
+      bool hasEph=false; for(const auto& ev:s.derived->riseSetEvents) if(ev.hasEphemeris || std::isfinite(ev.maxElevationDeg)) hasEph=true;
+      os<<(hasEph?"rise-set-summary:\n":"observed-arc-summary:\n");
+      for(const auto& ev:s.derived->riseSetEvents){
+        os<<"  "<<ev.satellite<<" first="<<ev.first<<" last="<<ev.last<<" duration_h="<<std::fixed<<std::setprecision(3)<<ev.durationHours<<" obs="<<ev.obsCount;
+        if(hasEph && std::isfinite(ev.maxElevationDeg)) os<<" max_el="<<std::setprecision(2)<<ev.maxElevationDeg;
+        os<<"\n";
+      }
+    }
+    if(s.derived->symbolCodesEnabled||s.derived->allSymbolsEnabled){ for(const auto& l:s.derived->symbolLegend) os<<"symbol: "<<l<<"\n"; }
+    if(s.derived->ssvEnabled){ os<<"per-sv-summary:\n"; for(const auto& kv:s.satelliteAppearance) os<<"  "<<kv.first<<" obs="<<kv.second<<"\n"; }
+    if(s.derived->svprEnabled){
+      os<<"sv-pseudorange-summary:\n";
+      for(const auto& satkv:s.derived->svPseudorangeStats){
+        os<<"  "<<satkv.first;
+        int shown=0;
+        for(const auto& codekv:satkv.second){
+          if(shown++>=12){ os<<" ..."; break; }
+          const auto& st=codekv.second;
+          os<<" "<<codekv.first<<"[n="<<st.count<<" mean="<<std::fixed<<std::setprecision(3)<<st.mean<<" min="<<st.min<<" max="<<st.max<<"]";
+        }
+        os<<"\n";
+      }
+    }
+  }
+  if(s.residuals){
+    os<<"residual-qc: candidates="<<s.residuals->candidateObservations<<" evaluated="<<s.residuals->evaluated<<" skipped="<<(s.residuals->skippedNoStation+s.residuals->skippedNoEphemeris+s.residuals->skippedNoPseudorange)<<"\n";
+    bool ext = s.derived && (s.derived->dataIndicatorsEnabled || s.derived->ceqcExtensionEnabled);
+    if(ext){
+      os<<"ceqc-ext residual-qc no_ephemeris_by_system:"; for(const char* sys : {"G","R","E","C","J"}){ auto it=s.residuals->skippedNoEphemerisBySystem.find(sys); os<<" "<<sys<<"="<<(it==s.residuals->skippedNoEphemerisBySystem.end()?0:it->second); } os<<"\n";
+      os<<"ceqc-ext residual-qc no_pseudorange_by_system:"; for(const char* sys : {"G","R","E","C","J"}){ auto it=s.residuals->skippedNoPseudorangeBySystem.find(sys); os<<" "<<sys<<"="<<(it==s.residuals->skippedNoPseudorangeBySystem.end()?0:it->second); } os<<"\n";
+      os<<"ceqc-ext code-minus-range-no-clock-meters: mean="<<s.residuals->rawMeanMeters<<" rms="<<s.residuals->rawRmsMeters<<" max_abs="<<s.residuals->rawMaxAbsMeters<<"\n";
+      os<<"ceqc-ext residual-bias-removed-meters: mean="<<s.residuals->meanMeters<<" rms="<<s.residuals->rmsMeters<<" max_abs="<<s.residuals->maxAbsMeters<<"\n";
+      for(const auto& kv:s.residuals->rawBySystem) os<<"ceqc-ext code-minus-range-no-clock-system "<<kv.first<<": n="<<kv.second.count<<" mean="<<kv.second.mean<<" rms="<<kv.second.rms<<"\n";
+      for(const auto& kv:s.residuals->biasRemovedBySystem) os<<"ceqc-ext residual-bias-removed-system "<<kv.first<<": n="<<kv.second.count<<" mean="<<kv.second.mean<<" rms="<<kv.second.rms<<"\n";
+      for(auto& w:s.residuals->warnings) os<<"ceqc-ext residual-warning: "<<w<<"\n";
+    }
+  }
   if(s.rtcm3){ os<<"rtcm3-frames: total="<<s.rtcm3->frameCount<<" good="<<s.rtcm3->goodFrameCount<<" bad_crc="<<s.rtcm3->badCRCCount<<" bytes="<<s.rtcm3->bytesRead<<"\n"; os<<"rtcm3-observations: epochs="<<s.rtcm3->epochCount<<" sat-observations="<<s.rtcm3->observationCount<<" values="<<s.rtcm3->observationValueCount<<"\n"; }
   if(s.ubx){ os<<"ubx-frames: total="<<s.ubx->frameCount<<" good="<<s.ubx->goodFrameCount<<" bad_checksum="<<s.ubx->badChecksumCount<<"\n"; os<<"ubx-observations: epochs="<<s.ubx->epochCount<<" sat-observations="<<s.ubx->observationCount<<" values="<<s.ubx->observationValueCount<<"\n"; os<<"ubx-sfrbx: messages="<<s.ubx->sfrbxCount<<"\n"; }
 }

@@ -206,6 +206,23 @@ std::string sysName(char c) {
 
 std::string lower(std::string s) { for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; }
 
+std::string normalizeSystemToken(std::string s) {
+  s = lower(s);
+  if (s == "g" || s == "gps") return "G";
+  if (s == "r" || s == "glo" || s == "glonass") return "R";
+  if (s == "e" || s == "gal" || s == "galileo") return "E";
+  if (s == "c" || s == "bds" || s == "bei" || s == "beidou") return "C";
+  if (s == "j" || s == "qzs" || s == "qzss") return "J";
+  if (s == "s" || s == "sbas") return "S";
+  if (s == "i" || s == "irn" || s == "navic") return "I";
+  if (!s.empty()) {
+    char c = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+    if (std::string("GRECJSI").find(c) != std::string::npos) return std::string(1, c);
+  }
+  return s;
+}
+
+
 } // namespace
 
 Operation parseArgs(const std::vector<std::string>& rawArgs) {
@@ -269,8 +286,8 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if ((a == "-st" || a == "+st") && nextIsValue(args, i)) op.windowStart = parseTime(args[++i]);
     else if ((a == "-e" || a == "+e") && nextIsValue(args, i)) op.windowEnd = parseTime(args[++i]);
     else if (a == "-nav" && nextIsValue(args, i)) op.qcOptions.navFiles = split(args[++i]);
-    else if (a == "-no_orbit" && nextIsValue(args, i)) { for (auto& s : split(args[++i], '+')) op.qcOptions.noOrbitSystems[s] = true; }
-    else if ((a == "-no_position" || a == "-no_pos") && nextIsValue(args, i)) { for (auto& s : split(args[++i], '+')) op.qcOptions.noPositionSystems[s] = true; }
+    else if (a == "-no_orbit" && nextIsValue(args, i)) { for (auto& s : split(args[++i], '+')) op.qcOptions.noOrbitSystems[normalizeSystemToken(s)] = true; }
+    else if ((a == "-no_position" || a == "-no_pos") && nextIsValue(args, i)) { for (auto& s : split(args[++i], '+')) op.qcOptions.noPositionSystems[normalizeSystemToken(s)] = true; }
     else if (a == "+ap") op.qcOptions.averagePosition = true;
     else if (a == "-ap") op.qcOptions.averagePosition = false;
     else if (a == "+pos" || a == "+position") op.qcOptions.positionOnly = true;
@@ -283,6 +300,8 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if (a == "-cl" || a == "-clock_slips") op.qcOptions.clockSlips = false;
     else if (a == "+data") op.qcOptions.dataIndicators = true;
     else if (a == "-data") op.qcOptions.dataIndicators = false;
+    else if (a == "+ceqc_ext" || a == "+ceqc-ext") op.qcOptions.ceqcExtension = true;
+    else if (a == "-ceqc_ext" || a == "-ceqc-ext") op.qcOptions.ceqcExtension = false;
     else if (a == "+ion") op.qcOptions.ion = true;
     else if (a == "-ion") op.qcOptions.ion = false;
     else if (a == "+iod") op.qcOptions.iod = true;
@@ -311,6 +330,8 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if (a == "++sym") op.qcOptions.allSymbols = true;
     else if (a == "+slips") { op.qcOptions.slipsEnabled = true; if (nextIsValue(args, i)) op.qcOptions.slipsTarget = args[++i]; }
     else if (a == "++slips") { op.qcOptions.slipsEnabled = true; op.qcOptions.slipsAppend = true; if (nextIsValue(args, i)) op.qcOptions.slipsTarget = args[++i]; }
+    else if (a == "-slips") { op.qcOptions.slipsEnabled = false; op.qcOptions.slipsAppend = false; op.qcOptions.slipsTarget.clear(); }
+    else if ((a == "+w" || a == "-w") && nextIsValue(args, i)) { int w = std::stoi(args[++i]); if (w > 0) op.qcOptions.width = w; }
     else if ((a == "-bins" || a == "-ion_bins" || a == "-mp_bins" || a == "-sn_bins" || a == "-min_SVs") && nextIsValue(args, i)) {
       int v = std::stoi(args[++i]);
       if (a == "-bins") op.qcOptions.bins = v;

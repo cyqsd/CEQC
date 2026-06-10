@@ -176,6 +176,7 @@ Quality check modes:
 	+ssv                       show per-SV summaries
 	+svpr                      show SV pseudorange summaries
 	+Y-code / -Y-code          Y-code report control
+	+ceqc_ext / -ceqc_ext      CEQC extended QC details on/off
 
 Examples:
 	ceqc +verify file.23o

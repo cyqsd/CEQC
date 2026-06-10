@@ -13,6 +13,32 @@ int main(){
   auto q = ceqc::service::qc::analyze(rf);
   assert(q.observationRecords == 3);
 
+  ceqc::model::QCOptions qoff;
+  qoff.ion=false; qoff.iod=false; qoff.multipath=false; qoff.snr=false; qoff.lli=false; qoff.pseudorangePhase=false; qoff.clockSlips=false; qoff.width=20;
+  auto q2 = ceqc::service::qc::analyze(rf, qoff);
+  assert(q2.derived);
+  assert(q2.derived->optionsActive.empty());
+  assert(q2.derived->snrStats.empty());
+  assert(q2.derived->multipathStats.empty());
+  assert(q2.derived->ionStats.empty());
+  assert(q2.derived->iodStats.empty());
+  assert(q2.derived->pseudorangePhase.empty());
+  assert(q2.derived->timeplot.size() == 22); // bars plus two delimiters
+  ceqc::model::QCOptions qdeep; qdeep.svpr=true; qdeep.yCode=true; qdeep.dataIndicators=true; qdeep.riseSet=true;
+  auto qdeepSum = ceqc::service::qc::analyze(rf, qdeep);
+  assert(qdeepSum.derived);
+  assert(!qdeepSum.derived->riseSetEvents.empty());
+  assert(qdeepSum.derived->dataCompleteness.completeRecords + qdeepSum.derived->dataCompleteness.partialRecords == qdeepSum.observationRecords);
+  assert(!qdeepSum.derived->svPseudorangeStats.empty());
+  assert(qdeepSum.derived->yCodeEnabled);
+
+  auto qop = ceqc::cli::parseArgs({"+qcq", "-ion", "-iod", "-mp", "-sn", "-lli", "-cl", "+w", "20", "-no_orbit", "GPS+BDS", "-no_pos", "GAL+QZS", "testdata/minimal_v3.23o"});
+  assert(qop.qc && qop.quietQC);
+  assert(!qop.qcOptions.ion && !qop.qcOptions.iod && !qop.qcOptions.multipath && !qop.qcOptions.snr && !qop.qcOptions.lli && !qop.qcOptions.clockSlips);
+  assert(qop.qcOptions.width == 20);
+  assert(qop.qcOptions.noOrbitSystems["G"] && qop.qcOptions.noOrbitSystems["C"]);
+  assert(qop.qcOptions.noPositionSystems["E"] && qop.qcOptions.noPositionSystems["J"]);
+
   // Structured teqc-style OBS edits should preserve REC/ANT columns and observable filtering.
   ceqc::service::rinex::applyHeaderEdits(rf, {{"-O.rn","RX001"},{"-O.rt","UM960"},{"-O.rv","1.0"},{"-O.an","ANT001"},{"-O.at","ADVNULL"},{"-O.px","1 2 3"}});
   bool recOk=false, antOk=false, posOk=false;

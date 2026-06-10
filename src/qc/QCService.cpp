@@ -27,6 +27,28 @@ double sampleStdDev(const QCMetricStats& s){
   return std::sqrt(std::max(0.0, centered/(s.count-1)));
 }
 int prnNumber(const std::string& sat){ if(sat.size()<2) return 0; try{return std::stoi(sat.substr(1));}catch(...){return 0;} }
+
+std::vector<int> histogramLinear(const std::vector<double>& values, int bins, double lo=std::numeric_limits<double>::quiet_NaN(), double hi=std::numeric_limits<double>::quiet_NaN()){
+  if(bins<=0) bins=18; if(bins>200) bins=200;
+  std::vector<int> h(static_cast<size_t>(bins),0);
+  std::vector<double> v; v.reserve(values.size());
+  for(double x:values) if(std::isfinite(x)) v.push_back(x);
+  if(v.empty()) return h;
+  if(!std::isfinite(lo)) lo=*std::min_element(v.begin(),v.end());
+  if(!std::isfinite(hi)) hi=*std::max_element(v.begin(),v.end());
+  if(!(hi>lo)){ h[0]=static_cast<int>(v.size()); return h; }
+  for(double x:v){
+    int b=static_cast<int>(std::floor((x-lo)/(hi-lo)*bins));
+    if(b<0) b=0; if(b>=bins) b=bins-1;
+    h[static_cast<size_t>(b)]++;
+  }
+  return h;
+}
+std::string histogramText(const std::vector<int>& h){
+  std::ostringstream os; os << "[";
+  for(size_t i=0;i<h.size();++i){ if(i) os << ","; os << h[i]; }
+  os << "]"; return os.str();
+}
 std::string makeBins(const std::vector<int>& counts, int width){
   if(width<=0) width=72; std::string out; out.reserve(width);
   int mx=1; for(int c:counts) mx=std::max(mx,c);
@@ -39,7 +61,13 @@ std::string makeBins(const std::vector<int>& counts, int width){
 void buildTeqcTimeplot(const RinexFile& rf, const QCOptions& opt, QCDerivedSummary& d){
   int width=std::max(10,opt.width);
   if(width>120) width=120;
-  if(rf.data.observationRecords.empty()){ d.timeplot="|"+std::string(width,' ')+"|"; d.obsTimeplot=std::string(width,'0'); return; }
+  if(rf.data.observationRecords.empty()){
+    d.timeplot="|"+std::string(width,' ')+"|";
+    d.obsTimeplot=std::string(width,'0');
+    d.navTimeplot=std::string(width,' ');
+    d.positionTimeplot=std::string(width,' ');
+    return;
+  }
   auto first=rf.data.observationRecords.front().time, last=first;
   for(const auto& r:rf.data.observationRecords){ if(r.time<first) first=r.time; if(r.time>last) last=r.time; }
   double span=std::max(1.0,std::chrono::duration<double>(last-first).count());
@@ -53,6 +81,8 @@ void buildTeqcTimeplot(const RinexFile& rf, const QCOptions& opt, QCDerivedSumma
   }
   d.obsBinCounts=obsBins;
   d.obsTimeplot=makeBins(obsBins,width);
+  d.navTimeplot=std::string(width,'n');      // OBS-only: no NAV QC was available.
+  d.positionTimeplot=std::string(width,'s'); // OBS-only: position QC skipped, not solved.
   d.timeplot="|"+d.obsTimeplot+"|";
   for(auto& kv:satBins){ std::string row; row.reserve(width); for(int c:kv.second) row.push_back(c>0?'c':' '); d.satelliteTimeplot[kv.first]=row; }
   std::set<int> gotGPS;
@@ -344,7 +374,7 @@ double ionoDelayMeters(const std::array<double,3>& rx, const std::array<double,3
 
 std::string sppReferenceSystem(const std::vector<ObservationRecord>& records, const std::vector<NavigationRecord>& navs, const QCOptions& opt){
   std::map<std::string,int> count;
-  for(const auto& rec:records){ if(!firstPseudorange(rec)) continue; if(nearestEph(navs,rec.satellite,rec.time,opt)) count[rec.system]++; }
+  for(const auto& rec:records){ if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue; if(!firstPseudorange(rec)) continue; if(nearestEph(navs,rec.satellite,rec.time,opt)) count[rec.system]++; }
   if(count["G"]+count["J"]>=4) return "G";
   int best=0; std::string sys;
   for(auto& kv:count){ if(kv.second>best){ best=kv.second; sys=kv.first; } }
@@ -361,9 +391,18 @@ std::optional<std::array<double,4>> solveEpochPosition(const std::vector<Observa
                                                        const std::array<double,3>& seed,
                                                        const QCOptions& opt,
                                                        const IonoModel& iono){
+  int eligibleSVs=0;
+  for(const auto& rec:records){
+    if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue;
+    if(!firstPseudorange(rec)) continue;
+    if(!nearestEph(navs,rec.satellite,rec.time,opt)) continue;
+    ++eligibleSVs;
+  }
+  if(eligibleSVs < std::max(4, opt.minSVs)) return {};
   std::string refSys=sppReferenceSystem(records,navs,opt);
   std::map<std::string,int> biasIndex;
   for(const auto& rec:records){
+    if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue;
     if(!firstPseudorange(rec)) continue;
     if(!nearestEph(navs,rec.satellite,rec.time,opt)) continue;
     if(isReferenceClockSystem(rec.system,refSys)) continue;
@@ -382,6 +421,7 @@ std::optional<std::array<double,4>> solveEpochPosition(const std::vector<Observa
       for(size_t ri=0; ri<records.size(); ++ri){
         if(!active[ri]) continue;
         const auto& rec=records[ri];
+        if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue;
         auto pr=firstPseudorange(rec); if(!pr) continue;
         auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph) continue;
         double tau=*pr/C;
@@ -485,7 +525,7 @@ QCMetricStats detrendedStatsBySat(const std::map<std::string,std::vector<double>
 }
 
 struct MPPoint { TimePoint time; double value=0.0; bool arcBreak=false; };
-QCMetricStats movingAverageMPStats(const std::map<std::string,std::vector<MPPoint>>& bySat, int window, bool excludeCurrent=false){
+QCMetricStats movingAverageMPStats(const std::map<std::string,std::vector<MPPoint>>& bySat, int window, bool excludeCurrent=false, double sigmaGate=4.0){
   std::vector<double> residuals;
   if(window < 2) window = 50;
   for(const auto& kv : bySat){
@@ -517,7 +557,7 @@ QCMetricStats movingAverageMPStats(const std::map<std::string,std::vector<MPPoin
     // teqc's MP moving-average summary suppresses large cycle-slip/multipath
     // outliers before reporting RMS.  Use the configured sigma threshold
     // behaviourally rather than retaining satellite median residuals.
-    double k = 4.0;
+    double k = std::isfinite(sigmaGate) && sigmaGate > 0.0 ? sigmaGate : 4.0;
     for(int iter=0; iter<3 && residuals.size()>4; ++iter){
       double m=mean(residuals);
       double ss=0.0; for(double v:residuals){ double d=v-m; ss+=d*d; }
@@ -576,6 +616,9 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
   std::map<std::string,std::vector<int>> lliBySatBin;
   std::map<std::string,std::vector<int>> incompleteBySatBin;
   std::map<std::string,std::vector<double>> mpBySatBin;
+  std::vector<int> navCandidateBins(width,0);
+  std::vector<int> navMissingBins(width,0);
+  std::vector<int> positionEligibleBins(width,0);
   std::set<std::string> observedSats;
   std::set<int> unhealthyGPS;
   std::map<std::string,bool> hasNav;
@@ -585,6 +628,14 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
     obsBySatBin[r.satellite].resize(width,0); lliBySatBin[r.satellite].resize(width,0); incompleteBySatBin[r.satellite].resize(width,0); mpBySatBin[r.satellite].resize(width,0.0);
     int b=(int)std::floor(std::chrono::duration<double>(r.time-first).count()/span*(width-1)+1e-9); if(b<0)b=0; if(b>=width)b=width-1;
     obsBySatBin[r.satellite][b]++;
+    if(firstPseudorange(r)){
+      if(nearestEph(navs,r.satellite,r.time,opt)) {
+        navCandidateBins[b]++;
+        if(!(opt.noPositionSystems.count(r.system) && opt.noPositionSystems.at(r.system))) positionEligibleBins[b]++;
+      } else {
+        navMissingBins[b]++;
+      }
+    }
     bool lli=false, hasL1=false, hasL2=false, hasP1=false, hasP2=false;
     double P1=std::numeric_limits<double>::quiet_NaN(),P2=std::numeric_limits<double>::quiet_NaN(),L1c=std::numeric_limits<double>::quiet_NaN(),L2c=std::numeric_limits<double>::quiet_NaN();
     for(const auto& v:r.values){
@@ -631,23 +682,46 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
   for(const auto& kv:obsBySatBin) {
     for(int i=0;i<width && i<(int)kv.second.size();++i) if(kv.second[i]>0) obsBins[i]++;
   }
-  // teqc's +dn row is essentially a compressed per-bin satellite population.
-  // For mixed GPS/GLONASS 15 s RINEX2 data, direct max-normalization is too high;
-  // use the observed SV count with the traditional single-character offset.
+  // Build a composite QC timeplot from the per-satellite states.  It must not
+  // collapse to all "9" merely because the position solution succeeded; gaps,
+  // missing navigation, incomplete dual-frequency observations and low elevation
+  // bins are preserved with teqc-like priority.
   std::string obsRow; obsRow.reserve(width);
-  for(int c:obsBins){ int d=std::clamp(c-9,0,9); obsRow.push_back(static_cast<char>('0'+d)); }
-  while((int)obsRow.size()<width) obsRow.push_back(' ');
-  if((int)obsRow.size()>width) obsRow.resize(width);
-  d.obsBinCounts=obsBins; d.obsTimeplot=obsRow; d.timeplot="|"+d.obsTimeplot+"|";
+  auto pri=[&](char x){
+    switch(x){ case 'L': return 90; case '2': return 70; case 'N': return 0; case '.': return 60; case '_': return 55; case '-': return 50; case '~': return 40; case '+': return 30; case 'c': return 20; default: return 0; }
+  };
+  for(int b=0;b<width;++b){
+    if(b >= (int)obsBins.size() || obsBins[b] == 0){ obsRow.push_back('g'); continue; }
+    char best='c'; int bestp=0;
+    for(const auto& kv:rows){ if(b < (int)kv.second.size()){ char c=kv.second[b]; int p=pri(c); if(p>bestp){ bestp=p; best=c; } } }
+    obsRow.push_back(best);
+  }
+  std::string navRow; navRow.reserve(width);
+  std::string posRow; posRow.reserve(width);
+  int minForPos=std::max(4,opt.minSVs);
+  for(int b=0;b<width;++b){
+    if(b >= (int)obsBins.size() || obsBins[b] == 0){ navRow.push_back('g'); posRow.push_back('g'); continue; }
+    if(navMissingBins[b] > 0) navRow.push_back('N'); else if(navCandidateBins[b] > 0) navRow.push_back('+'); else navRow.push_back('n');
+    if(positionEligibleBins[b] >= minForPos) posRow.push_back('P'); else posRow.push_back('s');
+  }
+  d.obsBinCounts=obsBins; d.obsTimeplot=obsRow; d.navTimeplot=navRow; d.positionTimeplot=posRow; d.timeplot="|"+d.obsTimeplot+"|";
   int eventBins=0; for(const auto& kv:mpBySatBin) for(double v:kv.second) if(std::isfinite(v) && std::fabs(v)>1e-6) ++eventBins;
   d.msecMpEventBins = std::max(0, eventBins/30);
 }
 void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRecord>& navs, const QCOptions& opt, QCSummary& s){
   if(!s.derived) s.derived=QCDerivedSummary{};
+  QCDerivedSummary& d=*s.derived;
   auto recXYZ=approxXYZ(rf.header);
   if(!recXYZ || std::sqrt((*recXYZ)[0]*(*recXYZ)[0]+(*recXYZ)[1]*(*recXYZ)[1]+(*recXYZ)[2]*(*recXYZ)[2]) < 1.0e6) recXYZ=estimateApproxPositionInternal(rf, navs, opt);
-  if(!recXYZ) return;
-  QCDerivedSummary& d=*s.derived;
+  if(!recXYZ){
+    // Still build observation/navigation timeplots when NAV is present; only the
+    // elevation/position rows are degraded.  This matches teqc's behaviour of
+    // not hiding OBS/NAV availability just because station coordinates are absent.
+    d.position.candidateEpochs=s.epochCount;
+    d.position.warnings.push_back("no station coordinates; position row skipped");
+    buildTeqcTimeplotWithNav(rf, navs, opt, d);
+    return;
+  }
   d.position.hasApprox=true;
   d.position.approxXYZ[0]=(*recXYZ)[0]; d.position.approxXYZ[1]=(*recXYZ)[1]; d.position.approxXYZ[2]=(*recXYZ)[2];
   d.position.averageXYZ[0]=(*recXYZ)[0]; d.position.averageXYZ[1]=(*recXYZ)[1]; d.position.averageXYZ[2]=(*recXYZ)[2];
@@ -745,17 +819,34 @@ void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRec
   if(!sn5.empty()) d.snrStats["5"]=stat(sn5);
   if(!snAll.empty()) d.snrStats["all"]=stat(snAll);
   d.freqTimeCodeCount = freqTimeCodeCount;
-  auto mp1=movingAverageMPStats(mp1BySat,opt.mpWindow,true), mp2=movingAverageMPStats(mp2BySat,opt.mpWindow,false);
-  if(mp1.count>0) d.mp1Meters=mp1.rms;
-  if(mp2.count>0) d.mp2Meters=mp2.rms;
+  auto mp1=movingAverageMPStats(mp1BySat,opt.mpWindow,true,opt.mpSigmas), mp2=movingAverageMPStats(mp2BySat,opt.mpWindow,false,opt.mpSigmas);
+  if(mp1.count>0){ d.mp1Meters=mp1.rms; d.multipathMovingCount["MP1"]=mp1.count; }
+  if(mp2.count>0){ d.mp2Meters=mp2.rms; d.multipathMovingCount["MP2"]=mp2.count; }
   for(auto& skv: mpComboBySystem){
     for(auto& ckv: skv.second){
-      auto st = movingAverageMPStats(ckv.second, opt.mpWindow, true);
+      auto st = movingAverageMPStats(ckv.second, opt.mpWindow, true, opt.mpSigmas);
       if(st.count<=0) continue;
       std::string key = skv.first + ":" + ckv.first;
       d.multipathStats[key]=st;
       d.multipathMovingRMS[key]=st.rms;
       d.multipathMovingCount[key]=st.count;
+    }
+  }
+  if(opt.multipath){
+    auto checkMp=[&](const std::string& name, double rmsMeters){
+      std::string key=name;
+      if(key.rfind("MP",0)==0) key=key.substr(2);
+      auto it=opt.mpRMSCM.find(key);
+      if(it!=opt.mpRMSCM.end() && std::isfinite(rmsMeters) && rmsMeters*100.0 > it->second){
+        std::ostringstream w; w << "multipath-rms: " << name << " rms=" << std::fixed << std::setprecision(2) << rmsMeters*100.0 << " cm exceeds " << it->second << " cm";
+        d.thresholdWarnings.push_back(w.str());
+      }
+    };
+    if(d.mp1Meters>0) checkMp("MP12", d.mp1Meters);
+    if(d.mp2Meters>0) checkMp("MP21", d.mp2Meters);
+    for(const auto& kv:d.multipathStats){
+      auto pos=kv.first.find(":MP");
+      if(pos!=std::string::npos) checkMp(kv.first.substr(pos+1), kv.second.rms);
     }
   }
 
@@ -784,26 +875,58 @@ void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRec
   std::map<std::string,std::vector<ObservationRecord>> byEpoch;
   for(const auto& r:rf.data.observationRecords) byEpoch[formatUTC(r.time)].push_back(r);
   std::vector<std::array<double,4>> sols;
-  for(const auto& kv:byEpoch){ if(auto sol=solveEpochPosition(kv.second, navs, *recXYZ, opt, iono)) sols.push_back(*sol); }
-  d.position.attempted=true; d.position.epochSolutions=static_cast<int>(sols.size());
+  d.position.candidateEpochs=static_cast<int>(byEpoch.size());
+  for(const auto& kv:byEpoch){
+    int eligible=0;
+    for(const auto& rec:kv.second){ if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue; if(firstPseudorange(rec) && nearestEph(navs,rec.satellite,rec.time,opt)) ++eligible; }
+    if(eligible < std::max(4,opt.minSVs)){ d.position.skippedInsufficientSVs++; continue; }
+    if(auto sol=solveEpochPosition(kv.second, navs, *recXYZ, opt, iono)){
+      sols.push_back(*sol);
+      std::map<std::string,std::set<std::string>> usedBySystem;
+      for(const auto& rec:kv.second){
+        if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue;
+        if(firstPseudorange(rec) && nearestEph(navs,rec.satellite,rec.time,opt)) usedBySystem[rec.system].insert(rec.satellite);
+      }
+      for(const auto& ukv:usedBySystem) d.position.usedSVsBySystem[ukv.first]=std::max(d.position.usedSVsBySystem[ukv.first], (int)ukv.second.size());
+      if(opt.everyEpochPosition){
+        auto llh=llhFromXYZ({(*sol)[0],(*sol)[1],(*sol)[2]});
+        QCEpochPosition ep; ep.time=kv.first; ep.x=(*sol)[0]; ep.y=(*sol)[1]; ep.z=(*sol)[2]; ep.latDeg=llh[0]*180.0/PI; ep.lonDeg=llh[1]*180.0/PI; ep.heightM=llh[2]; ep.clockBiasM=(*sol)[3]; ep.usedSVs=eligible; ep.status="OK";
+        d.epochPositions.push_back(ep);
+      }
+    } else if(opt.everyEpochPosition){
+      QCEpochPosition ep; ep.time=kv.first; ep.usedSVs=eligible; ep.status="NO_SOLUTION"; d.epochPositions.push_back(ep);
+    }
+  }
+  d.position.attempted=true; d.position.skippedNoNavigation=false; d.position.epochSolutions=static_cast<int>(sols.size());
   if(!sols.empty()){
     for(auto& sol:sols){ d.position.averageXYZ[0]+=sol[0]; d.position.averageXYZ[1]+=sol[1]; d.position.averageXYZ[2]+=sol[2]; }
     d.position.averageXYZ[0]/=sols.size(); d.position.averageXYZ[1]/=sols.size(); d.position.averageXYZ[2]/=sols.size();
   }
   buildTeqcTimeplotWithNav(rf, navs, opt, d);
+  for(auto& ev : d.riseSetEvents){ auto it=d.satelliteMaxElevationDeg.find(ev.satellite); if(it!=d.satelliteMaxElevationDeg.end()){ ev.maxElevationDeg=it->second; ev.hasEphemeris=true; } }
 }
 
 
 ResidualStats residual(const RinexFile& rf,const std::vector<NavigationRecord>& navs,const QCOptions& opt){
-  ResidualStats st; auto rx=approxXYZ(rf.header); if(!rx){ st.skippedNoStation=(int)rf.data.observationRecords.size(); st.warnings.push_back("no APPROX POSITION XYZ in observation header; residual QC skipped"); return st; }
-  
-struct Row { std::string epoch, sat, sys; double raw=0, epochCentered=0; };
+  ResidualStats st;
+  auto rx=approxXYZ(rf.header);
+  if(!rx){
+    st.skippedNoStation=(int)rf.data.observationRecords.size();
+    st.warnings.push_back("no APPROX POSITION XYZ in observation header; residual QC skipped");
+    return st;
+  }
+
+  struct Row { std::string epoch, sat, sys; double raw=0, epochCentered=0, biasRemoved=0; };
   std::vector<Row> rows;
   std::map<std::string,std::vector<double>> byEpoch;
+  std::map<std::string,std::vector<double>> rawBySystem;
+
   for(auto& rec:rf.data.observationRecords){
     st.candidateObservations++;
-    auto pr=firstPseudorange(rec); if(!pr){ st.skippedNoPseudorange++; continue; }
-    auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph){ st.skippedNoEphemeris++; continue; }
+    auto pr=firstPseudorange(rec);
+    if(!pr){ st.skippedNoPseudorange++; st.skippedNoPseudorangeBySystem[rec.system]++; continue; }
+    auto eph=nearestEph(navs,rec.satellite,rec.time,opt);
+    if(!eph){ st.skippedNoEphemeris++; st.skippedNoEphemerisBySystem[rec.system]++; continue; }
     double tau=*pr/C; SatState ss;
     for(int i=0;i<3;++i){
       ss=prop(*eph, rec.time-std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(tau)));
@@ -811,16 +934,28 @@ struct Row { std::string epoch, sat, sys; double raw=0, epochCentered=0; };
       auto rot=sagnac(ss.xyz,tau);
       tau=norm3(rot,*rx)/C;
     }
-    if(!ss.ok){ st.skippedNoEphemeris++; continue; }
+    if(!ss.ok){ st.skippedNoEphemeris++; st.skippedNoEphemerisBySystem[rec.system]++; continue; }
     auto rot=sagnac(ss.xyz,tau);
     double rho=norm3(rot,*rx);
+    // Raw code-minus-range residual.  Corrections intentionally remain minimal here;
+    // the bias-removed series below is reported separately so callers can see both
+    // the absolute broadcast/code behaviour and the de-biased QC scatter.
     double res=*pr-rho+C*ss.clk;
-    Row row{formatUTC(rec.time),rec.satellite,rec.system,res,0};
+    Row row{formatUTC(rec.time),rec.satellite,rec.system,res,0,0};
     rows.push_back(row);
     byEpoch[row.epoch].push_back(res);
+    rawBySystem[row.sys].push_back(res);
     st.evaluated++; st.bySystem[rec.system]++;
     if(rec.system=="G") st.gps++; else if(rec.system=="R") st.glonass++; else if(rec.system=="E") st.galileo++; else if(rec.system=="C") st.beidou++;
   }
+
+  std::vector<double> rawValues;
+  rawValues.reserve(rows.size());
+  for(const auto& r:rows) rawValues.push_back(r.raw);
+  auto rawStat=stat(rawValues);
+  st.rawMeanMeters=rawStat.mean; st.rawRmsMeters=rawStat.rms; st.rawMaxAbsMeters=std::max(std::fabs(rawStat.min),std::fabs(rawStat.max));
+  for(auto& kv:rawBySystem) st.rawBySystem[kv.first]=stat(kv.second);
+
   std::map<std::string,double> epochMed;
   for(auto& kv:byEpoch) epochMed[kv.first]=median(kv.second);
   std::map<std::string,std::vector<double>> bySat;
@@ -832,11 +967,13 @@ struct Row { std::string epoch, sat, sys; double raw=0, epochCentered=0; };
   for(auto& r:rows){
     double v=r.epochCentered;
     if(satMed.count(r.sat)) v-=satMed[r.sat];
+    r.biasRemoved=v;
     centered.push_back(v); bySystem[r.sys].push_back(v);
   }
   if(!satMed.empty()) st.warnings.push_back("residual-calibration: satellite-specific code/orbit bias removed for "+std::to_string(satMed.size())+" satellites");
-  if(!centered.empty()){ double sum=0,ss=0,mx=0; for(double v:centered){sum+=v; ss+=v*v; mx=std::max(mx,std::fabs(v));} st.meanMeters=sum/centered.size(); st.rmsMeters=std::sqrt(ss/centered.size()); st.maxAbsMeters=mx; }
-  for(auto& kv:bySystem){ if(kv.second.size()<2) continue; double ss=0,mx=0; for(double v:kv.second){ ss+=v*v; mx=std::max(mx,std::fabs(v)); } std::ostringstream os; os<<"residual-system "<<kv.first<<": n="<<kv.second.size()<<" median_removed_rms="<<std::fixed<<std::setprecision(3)<<std::sqrt(ss/kv.second.size())<<" max_abs="<<mx; st.warnings.push_back(os.str()); }
+  auto bstat=stat(centered);
+  st.meanMeters=bstat.mean; st.rmsMeters=bstat.rms; st.maxAbsMeters=std::max(std::fabs(bstat.min),std::fabs(bstat.max));
+  for(auto& kv:bySystem) st.biasRemovedBySystem[kv.first]=stat(kv.second);
   return st;
 }
 } // namespace
@@ -844,28 +981,36 @@ std::optional<std::array<double,3>> estimateApproxPosition(const RinexFile& rf, 
 QCSummary analyze(const RinexFile& rf,const QCOptions& opt){ QCSummary s; s.sourcePath=rf.path; s.version=rf.header.version; s.kind=rf.header.kind; s.headerIssues=ceqc::service::rinex::validate(rf);
   auto headerValue=[&](const std::string& label)->std::string{ auto it=rf.header.byLabel.find(label); if(it==rf.header.byLabel.end()||it->second.empty()) return {}; auto v=rf.header.lines[it->second.front()].value; auto a=v.find_first_not_of(' '); auto b=v.find_last_not_of(' '); return a==std::string::npos?std::string{}:v.substr(a,b-a+1); };
   auto fixedField=[&](const std::string& label,size_t off,size_t len)->std::string{ auto it=rf.header.byLabel.find(label); if(it==rf.header.byLabel.end()||it->second.empty()) return {}; auto v=rf.header.lines[it->second.front()].value; if(off>=v.size()) return {}; auto x=v.substr(off,std::min(len,v.size()-off)); auto a=x.find_first_not_of(' '); auto b=x.find_last_not_of(' '); return a==std::string::npos?std::string{}:x.substr(a,b-a+1); };
-  s.markerName=headerValue("MARKER NAME"); s.markerNumber=headerValue("MARKER NUMBER"); s.receiverNumber=fixedField("REC # / TYPE / VERS",0,20); s.receiverType=fixedField("REC # / TYPE / VERS",20,20); s.receiverVersion=fixedField("REC # / TYPE / VERS",40,20); s.antennaNumber=fixedField("ANT # / TYPE",0,20); s.antennaType=fixedField("ANT # / TYPE",20,20); if(rf.rtcm3) s.rtcm3=*rf.rtcm3; if(rf.ubx) s.ubx=*rf.ubx; if(rf.header.kind==RinexKind::Obs){ s.epochCount=(int)rf.data.observationEpochs.size(); s.observationRecords=(int)rf.data.observationRecords.size(); std::map<std::string,int> epochSV; for(auto& r:rf.data.observationRecords){ s.satelliteAppearance[r.satellite]++; s.systemAppearance[r.system]++; epochSV[formatUTC(r.time)]++; for(auto& v:r.values){ if(v.value) s.observationValues++; else s.missingObservations++; } if(!s.firstEpoch||r.time<*s.firstEpoch)s.firstEpoch=r.time; if(!s.lastEpoch||r.time>*s.lastEpoch)s.lastEpoch=r.time; }
-    if(s.firstEpoch&&s.lastEpoch&&s.epochCount>1) s.estimatedIntervalS=std::chrono::duration<double>(*s.lastEpoch-*s.firstEpoch).count()/(s.epochCount-1); QCDerivedSummary d; d.optionsActive={"+ion","+iod","+mp","+sn"};
+  s.markerName=headerValue("MARKER NAME"); s.markerNumber=headerValue("MARKER NUMBER"); s.receiverNumber=fixedField("REC # / TYPE / VERS",0,20); s.receiverType=fixedField("REC # / TYPE / VERS",20,20); s.receiverVersion=fixedField("REC # / TYPE / VERS",40,20); s.antennaNumber=fixedField("ANT # / TYPE",0,20); s.antennaType=fixedField("ANT # / TYPE",20,20); if(rf.rtcm3) s.rtcm3=*rf.rtcm3; if(rf.ubx) s.ubx=*rf.ubx; if(rf.header.kind==RinexKind::Obs){ s.epochCount=(int)rf.data.observationEpochs.size(); s.observationRecords=(int)rf.data.observationRecords.size(); std::map<std::string,int> epochSV; std::map<std::string,TimePoint> satFirst, satLast; std::map<std::string,int> satObsCount; std::map<std::string,std::map<std::string,std::vector<double>>> svCodeValues; int completeRecords=0, partialRecords=0, yCodeObservations=0; for(auto& r:rf.data.observationRecords){ s.satelliteAppearance[r.satellite]++; s.systemAppearance[r.system]++; epochSV[formatUTC(r.time)]++; if(!satFirst.count(r.satellite)||r.time<satFirst[r.satellite]) satFirst[r.satellite]=r.time; if(!satLast.count(r.satellite)||r.time>satLast[r.satellite]) satLast[r.satellite]=r.time; satObsCount[r.satellite]++; int missingInRecord=0; for(auto& v:r.values){ if(v.value){ s.observationValues++; if((!v.type.empty() && (v.type[0]=='C'||v.type[0]=='P'))) svCodeValues[r.satellite][v.type].push_back(*v.value); if(r.system=="G" && (v.type=="P1"||v.type=="P2"||v.type=="C1W"||v.type=="C2W"||v.type=="L1W"||v.type=="L2W"||v.type=="S1W"||v.type=="S2W")) yCodeObservations++; } else { s.missingObservations++; missingInRecord++; } } if(missingInRecord==0) completeRecords++; else partialRecords++; if(!s.firstEpoch||r.time<*s.firstEpoch)s.firstEpoch=r.time; if(!s.lastEpoch||r.time>*s.lastEpoch)s.lastEpoch=r.time; }
+    if(s.firstEpoch&&s.lastEpoch&&s.epochCount>1) s.estimatedIntervalS=std::chrono::duration<double>(*s.lastEpoch-*s.firstEpoch).count()/(s.epochCount-1); QCDerivedSummary d; d.ionEnabled=opt.ion; d.iodEnabled=opt.iod; d.multipathEnabled=opt.multipath; d.snrEnabled=opt.snr; d.lliEnabled=opt.lli; d.pseudorangePhaseEnabled=opt.pseudorangePhase; d.clockSlipsEnabled=opt.clockSlips; d.plotEnabled=opt.plot; d.symbolCodesEnabled=opt.symbolCodes; d.allSymbolsEnabled=opt.allSymbols; d.riseSetEnabled=opt.riseSet; d.ssvEnabled=opt.ssv; d.svprEnabled=opt.svpr; d.dataIndicatorsEnabled=opt.dataIndicators; d.ceqcExtensionEnabled=opt.ceqcExtension; d.yCodeEnabled=opt.yCode; d.everyEpochXYZ=opt.everyEpochXYZ; d.everyEpochGeodetic=opt.everyEpochGeodetic; d.everyEpochDecimal=opt.everyEpochDecimal; d.minSVsUsed=opt.minSVs; if(opt.ion) d.optionsActive.push_back("+ion"); if(opt.iod) d.optionsActive.push_back("+iod"); if(opt.multipath) d.optionsActive.push_back("+mp"); if(opt.snr) d.optionsActive.push_back("+sn"); if(opt.lli) d.optionsActive.push_back("+lli"); if(opt.pseudorangePhase) d.optionsActive.push_back("+pl"); if(opt.clockSlips) d.optionsActive.push_back("+cl"); if(opt.everyEpochPosition) d.optionsActive.push_back("+eep"); if(opt.positionOnly) d.optionsActive.push_back("+pos"); if(opt.symbolCodes) d.optionsActive.push_back("+sym"); if(opt.allSymbols) d.optionsActive.push_back("++sym"); if(!opt.riseSet) d.optionsActive.push_back("-rs"); if(opt.ssv) d.optionsActive.push_back("+ssv"); if(opt.svpr) d.optionsActive.push_back("+svpr"); if(opt.mpRaw) d.optionsActive.push_back("+mp_raw"); if(opt.yCode) d.optionsActive.push_back("+Y-code"); if(opt.dataIndicators) d.optionsActive.push_back("+data"); if(opt.ceqcExtension) d.optionsActive.push_back("+ceqc_ext");
+    d.dataCompleteness.completeRecords=completeRecords; d.dataCompleteness.partialRecords=partialRecords; d.dataCompleteness.missingValues=s.missingObservations; d.dataCompleteness.yCodeObservations=yCodeObservations;
+    for(const auto& kv:satFirst){ QCRiseSetEvent ev; ev.satellite=kv.first; ev.first=formatUTC(kv.second); ev.last=formatUTC(satLast[kv.first]); ev.durationHours=std::max(0.0,std::chrono::duration<double>(satLast[kv.first]-kv.second).count()/3600.0); ev.obsCount=satObsCount[kv.first]; d.riseSetEvents.push_back(ev); }
+    std::sort(d.riseSetEvents.begin(), d.riseSetEvents.end(), [](const auto& a,const auto& b){ if(a.satellite.empty()||b.satellite.empty()) return a.satellite<b.satellite; if(a.satellite[0]!=b.satellite[0]) return a.satellite<b.satellite; return prnNumber(a.satellite)<prnNumber(b.satellite); });
+    for(const auto& satkv:svCodeValues){ for(const auto& codekv:satkv.second){ d.svPseudorangeStats[satkv.first][codekv.first]=stat(codekv.second); } }
+    
     {
       std::set<char> codeBands;
       for (const auto& r2 : rf.data.observationRecords) for (const auto& v2 : r2.values) if (v2.value && !v2.type.empty() && v2.type[0]=='C' && v2.type.size()>=2) codeBands.insert(v2.type[1]);
       d.codeBandCount = static_cast<int>(codeBands.size());
     }
     if(!epochSV.empty()){ std::vector<int> nums; for(auto& kv:epochSV)nums.push_back(kv.second); d.epochSVMin=*std::min_element(nums.begin(),nums.end()); d.epochSVMax=*std::max_element(nums.begin(),nums.end()); d.epochSVMean=mean(nums); }
-    std::vector<double> sn,prph; std::map<std::string,std::vector<double>> snByBand; std::map<std::string,std::map<std::string,std::map<std::string,std::vector<MPPoint>>>> mpComboBasic; std::map<std::string,TimePoint> last; int idx=0; for(auto& e:rf.data.observationEpochs){ if(last.count("epoch")){ double gap=std::chrono::duration<double>(e.time-last["epoch"]).count(); if(gap>opt.gapMinMinutes*60){ d.gapEvents.push_back({formatUTC(last["epoch"]),formatUTC(e.time),gap,idx}); d.slipEvents.push_back({formatUTC(e.time),"*","gap",std::to_string((int)gap)+" seconds"}); } } last["epoch"]=e.time; ++idx; }
-    std::map<std::string,TimePoint> lastSat; std::map<std::string,double> lastPrph; for(auto& r:rf.data.observationRecords){ std::optional<double> Cc,Lc; for(auto& v:r.values){ if(!v.lli.empty()){ d.lliCount++; d.slipEvents.push_back({formatUTC(r.time),r.satellite,"LLI",v.type+":"+v.lli}); } if(v.value&&v.type.rfind("S",0)==0){ sn.push_back(*v.value); auto band=v.type.size()>1?std::string(1,v.type[1]):std::string("1"); snByBand[band].push_back(*v.value); if(opt.minSNR.count(band) && *v.value < opt.minSNR.at(band)) d.snrStats[band].lowCount++; } if(v.value&&v.type.rfind("C",0)==0&&!Cc) Cc=v.value; if(v.value&&v.type.rfind("L",0)==0&&!Lc) Lc=v.value; } if(Cc&&Lc){ double pp=*Cc-*Lc; prph.push_back(pp); if(lastPrph.count(r.satellite)){ double jump=std::fabs(pp-lastPrph[r.satellite]); if(jump>50.0){ d.multipathStats["all"].jumps++; d.slipEvents.push_back({formatUTC(r.time),r.satellite,"P-L jump",std::to_string(jump)}); } } lastPrph[r.satellite]=pp; } if(lastSat.count(r.satellite)){ double dt=std::chrono::duration<double>(r.time-lastSat[r.satellite]).count(); if(dt>opt.gapMinMinutes*60) d.slipEvents.push_back({formatUTC(r.time),r.satellite,"sat gap",std::to_string((int)dt)+" seconds"}); }
+    std::vector<double> sn,prph,ionVals,mpVals; std::map<std::string,std::vector<double>> snByBand; std::map<std::string,std::vector<double>> snBySystemCode; std::map<std::string,std::map<std::string,std::map<std::string,std::vector<MPPoint>>>> mpComboBasic; std::map<std::string,TimePoint> last; int idx=0; for(auto& e:rf.data.observationEpochs){ if(last.count("epoch")){ double gap=std::chrono::duration<double>(e.time-last["epoch"]).count(); if(gap>opt.gapMinMinutes*60){ d.gapEvents.push_back({formatUTC(last["epoch"]),formatUTC(e.time),gap,idx}); if(opt.clockSlips) d.slipEvents.push_back({formatUTC(e.time),"*","gap",std::to_string((int)gap)+" seconds"}); } } last["epoch"]=e.time; ++idx; }
+    std::map<std::string,TimePoint> lastSat; std::map<std::string,double> lastPrph; for(auto& r:rf.data.observationRecords){ std::optional<double> Cc,Lc; for(auto& v:r.values){ if(opt.lli && !v.lli.empty()){ d.lliCount++; if(opt.clockSlips) d.slipEvents.push_back({formatUTC(r.time),r.satellite,"LLI",v.type+":"+v.lli}); } if(opt.snr && v.value&&v.type.rfind("S",0)==0){ sn.push_back(*v.value); auto band=v.type.size()>1?std::string(1,v.type[1]):std::string("1"); snByBand[band].push_back(*v.value); std::string codeKey=r.system+":"+v.type; snBySystemCode[codeKey].push_back(*v.value); if(opt.minSNR.count(band) && *v.value < opt.minSNR.at(band)){ d.snrStats[band].lowCount++; d.snrStats[codeKey].lowCount++; } } if(v.value&&v.type.rfind("C",0)==0&&!Cc) Cc=v.value; if(v.value&&v.type.rfind("L",0)==0&&!Lc) Lc=v.value; } if(Cc&&Lc){ double pp=*Cc-*Lc; prph.push_back(pp); if(lastPrph.count(r.satellite)){ double jump=std::fabs(pp-lastPrph[r.satellite]); double jumpCM=jump*100.0; if(opt.ion && jumpCM>opt.ionJumpCM) d.ionStats["all"].jumps++; if(opt.iod && lastSat.count(r.satellite)){ double dtmin=std::max(1e-9,std::chrono::duration<double>(r.time-lastSat[r.satellite]).count()/60.0); if(jumpCM/dtmin>opt.iodJumpCMPerMin) d.iodStats["all"].jumps++; } double ms=C*1.0e-3; double rem=std::fabs(jump-std::round(jump/ms)*ms); if(opt.clockSlips && rem<=opt.msecTol) d.clockSlipCount++; if(jump>50.0){ if(opt.multipath) d.multipathStats["all"].jumps++; if(opt.clockSlips) d.slipEvents.push_back({formatUTC(r.time),r.satellite,"P-L jump",std::to_string(jump)}); } } lastPrph[r.satellite]=pp; } if(lastSat.count(r.satellite)){ double dt=std::chrono::duration<double>(r.time-lastSat[r.satellite]).count(); if(opt.clockSlips && dt>opt.gapMinMinutes*60) d.slipEvents.push_back({formatUTC(r.time),r.satellite,"sat gap",std::to_string((int)dt)+" seconds"}); }
       std::set<char> bands; for(const auto& v:r.values) if(v.value && v.type.size()>=2) bands.insert(v.type[1]);
+      if(opt.ion){
+        for(char bi:bands){ double Pi=obsValue(r,'C',bi); if(!std::isfinite(Pi)) continue; for(char bj:bands){ if(bj<=bi) continue; double Pj=obsValue(r,'C',bj); if(std::isfinite(Pj)) ionVals.push_back(Pi-Pj); }}
+      }
       bool arcBreak=false; for(const auto& vv:r.values) if(!vv.lli.empty()) arcBreak=true;
-      for(char bi:bands){ double Pi=obsValue(r,'C',bi); double Li=carrierMeters(r,bi,nullptr); double fi=signalFrequencyHz(r.system,bi,nullptr); if(!std::isfinite(Pi)||!std::isfinite(Li)||fi<=0) continue; for(char bj:bands){ if(bj==bi) continue; double Lj=carrierMeters(r,bj,nullptr); double fj=signalFrequencyHz(r.system,bj,nullptr); if(!std::isfinite(Lj)||fj<=0) continue; double a=(fi/fj)*(fi/fj); if(std::fabs(a-1.0)<1e-12) continue; double mp=Pi-(1.0+2.0/(a-1.0))*Li+(2.0/(a-1.0))*Lj; std::string key=std::string("MP")+bi+bj; mpComboBasic[r.system][key][r.satellite].push_back({r.time,mp,arcBreak}); }}
+      if(opt.multipath) for(char bi:bands){ double Pi=obsValue(r,'C',bi); double Li=carrierMeters(r,bi,nullptr); double fi=signalFrequencyHz(r.system,bi,nullptr); if(!std::isfinite(Pi)||!std::isfinite(Li)||fi<=0) continue; for(char bj:bands){ if(bj==bi) continue; double Lj=carrierMeters(r,bj,nullptr); double fj=signalFrequencyHz(r.system,bj,nullptr); if(!std::isfinite(Lj)||fj<=0) continue; double a=(fi/fj)*(fi/fj); if(std::fabs(a-1.0)<1e-12) continue; double mp=Pi-(1.0+2.0/(a-1.0))*Li+(2.0/(a-1.0))*Lj; mpVals.push_back(mp); std::string key=std::string("MP")+bi+bj; mpComboBasic[r.system][key][r.satellite].push_back({r.time,mp,arcBreak}); }}
       lastSat[r.satellite]=r.time; }
-    int lowAll = 0; for(auto& kv:d.snrStats) lowAll += kv.second.lowCount; d.snrStats["all"]=stat(sn); d.snrStats["all"].lowCount = lowAll; for(auto& kv:snByBand){ int low=d.snrStats[kv.first].lowCount; d.snrStats[kv.first]=stat(kv.second); d.snrStats[kv.first].lowCount=low; }
-    d.pseudorangePhase["all"]=stat(prph); auto mpstat=stat(prph); mpstat.jumps=d.multipathStats["all"].jumps; d.multipathStats["all"]=mpstat;
-    for(auto& skv: mpComboBasic){ for(auto& ckv: skv.second){ auto st=movingAverageMPStats(ckv.second,opt.mpWindow,true); if(st.count>0){ std::string key=skv.first+":"+ckv.first; d.multipathStats[key]=st; d.multipathMovingRMS[key]=st.rms; d.multipathMovingCount[key]=st.count; } } }
-    d.ionStats["all"]=stat(prph); d.iodStats["all"]=stat({}); d.deletedObservations=(d.codeBandCount<2?static_cast<int>(rf.data.observationRecords.size()):0); buildTeqcTimeplot(rf,opt,d); d.symbolLegend={"c code/phase observation epoch","L loss-of-lock","g gap"}; d.position.attempted=opt.averagePosition||opt.everyEpochPosition; d.position.epochSolutions=s.epochCount; s.derived=d; } else if(rf.header.kind==RinexKind::Nav){ s.navigationRecords=(int)rf.data.navigationRecords.size(); for(auto& r:rf.data.navigationRecords){ s.navigationValues+=(int)r.values.size(); s.navigationFields+=(int)r.fields.size(); if(!r.satellite.empty())s.satelliteAppearance[r.satellite]++; if(r.epoch){ if(!s.firstEpoch||*r.epoch<*s.firstEpoch)s.firstEpoch=r.epoch; if(!s.lastEpoch||*r.epoch>*s.lastEpoch)s.lastEpoch=r.epoch; } } s.broadcastEphemerides=s.navigationRecords; } else if(rf.header.kind==RinexKind::Met){ s.meteorologicalRecords=(int)rf.data.meteorologicalRecords.size(); for(auto& r:rf.data.meteorologicalRecords) s.meteorologicalValues+=(int)r.values.size(); } return s; }
+    if(opt.snr){ int lowAll = 0; for(auto& kv:d.snrStats) lowAll += kv.second.lowCount; d.snrStats["all"]=stat(sn); d.snrStats["all"].lowCount = lowAll; for(auto& kv:snByBand){ int low=d.snrStats[kv.first].lowCount; d.snrStats[kv.first]=stat(kv.second); d.snrStats[kv.first].lowCount=low; } for(auto& kv:snBySystemCode){ int low=d.snrStats[kv.first].lowCount; d.snrStats[kv.first]=stat(kv.second); d.snrStats[kv.first].lowCount=low; } }
+    if(opt.pseudorangePhase) d.pseudorangePhase["all"]=stat(prph);
+    if(opt.multipath){ auto mpstat=stat(mpVals); mpstat.jumps=d.multipathStats["all"].jumps; d.multipathStats["all"]=mpstat; for(auto& skv: mpComboBasic){ for(auto& ckv: skv.second){ auto st=movingAverageMPStats(ckv.second,opt.mpWindow,true,opt.mpSigmas); if(st.count>0){ std::string key=skv.first+":"+ckv.first; d.multipathStats[key]=st; d.multipathMovingRMS[key]=st.rms; d.multipathMovingCount[key]=st.count; } } } int mp1c=0, mp2c=0; double mp1ss=0.0, mp2ss=0.0; for(const auto& kv:d.multipathStats){ if(kv.first.size()>=4 && kv.first.find("MP12")!=std::string::npos){ mp1c+=kv.second.count; mp1ss+=kv.second.rms*kv.second.rms*kv.second.count; } if(kv.first.size()>=4 && kv.first.find("MP21")!=std::string::npos){ mp2c+=kv.second.count; mp2ss+=kv.second.rms*kv.second.rms*kv.second.count; } } if(mp1c>0){ d.multipathMovingCount["MP1"]=mp1c; if(d.mp1Meters<=0) d.mp1Meters=std::sqrt(mp1ss/mp1c); } if(mp2c>0){ d.multipathMovingCount["MP2"]=mp2c; if(d.mp2Meters<=0) d.mp2Meters=std::sqrt(mp2ss/mp2c); } }
+    if(opt.ion){ auto st=stat(ionVals); st.jumps=d.ionStats["all"].jumps; d.ionStats["all"]=st; d.histogramSamples["ion"]=(int)ionVals.size(); if(!ionVals.empty()) d.histograms["ion"]=histogramLinear(ionVals,opt.ionBins); } if(opt.iod){ auto st=stat({}); st.jumps=d.iodStats["all"].jumps; d.iodStats["all"]=st; } if(opt.snr){ d.histogramSamples["snr"]=(int)sn.size(); if(!sn.empty()) d.histograms["snr"]=histogramLinear(sn,opt.snBins,0.0,60.0); } if(opt.multipath){ d.histogramSamples["mp"]=(int)mpVals.size(); if(!mpVals.empty()) d.histograms["mp"]=histogramLinear(mpVals,opt.mpBins); } if(opt.pseudorangePhase){ d.histogramSamples["pseudorange_phase"]=(int)prph.size(); if(!prph.empty()) d.histograms["pseudorange_phase"]=histogramLinear(prph,opt.bins); } if(opt.pseudorangePhase && !prph.empty()){ auto pst=stat(prph); double sd=sampleStdDev(pst); if(sd>0 && std::fabs(pst.mean)>opt.codeSigmas*sd){ std::ostringstream w; w<<"code-sigma: mean exceeds "<<opt.codeSigmas<<" sigma gate"; d.thresholdWarnings.push_back(w.str()); } } d.deletedObservations=(d.codeBandCount<2?static_cast<int>(rf.data.observationRecords.size()):0); buildTeqcTimeplot(rf,opt,d); if(opt.symbolCodes||opt.allSymbols) d.symbolLegend={"c code/phase observation epoch","L loss-of-lock","g gap","N observed without navigation","2 incomplete dual-frequency","~ observed above mask","+ expected above mask","_ below mask","- below horizon"}; d.position.candidateEpochs=s.epochCount; d.position.skippedNoNavigation=(opt.averagePosition||opt.everyEpochPosition); d.position.attempted=false; d.position.epochSolutions=0; s.derived=d; } else if(rf.header.kind==RinexKind::Nav){ s.navigationRecords=(int)rf.data.navigationRecords.size(); for(auto& r:rf.data.navigationRecords){ s.navigationValues+=(int)r.values.size(); s.navigationFields+=(int)r.fields.size(); if(!r.satellite.empty())s.satelliteAppearance[r.satellite]++; if(r.epoch){ if(!s.firstEpoch||*r.epoch<*s.firstEpoch)s.firstEpoch=r.epoch; if(!s.lastEpoch||*r.epoch>*s.lastEpoch)s.lastEpoch=r.epoch; } } s.broadcastEphemerides=s.navigationRecords; } else if(rf.header.kind==RinexKind::Met){ s.meteorologicalRecords=(int)rf.data.meteorologicalRecords.size(); for(auto& r:rf.data.meteorologicalRecords) s.meteorologicalValues+=(int)r.values.size(); } return s; }
 QCSummary analyzeWithNavigation(const RinexFile& rf,const std::vector<NavigationRecord>& navs,const QCOptions& opt){ auto s=analyze(rf,opt); if(rf.header.kind==RinexKind::Obs&&!navs.empty()){ s.residuals=residual(rf,navs,opt); applyNavBasedQCMetrics(rf, navs, opt, s); } return s; }
 std::string makePlot(const QCSummary& summary){
   std::ostringstream os;
-  os << "COMPACT3 CEQC 5.5.0\n";
+  os << "COMPACT3 CEQC 0.0.1\n";
   os << "file " << summary.sourcePath << "\n";
   os << "epochs " << summary.epochCount << " obs_records " << summary.observationRecords << "\n";
   if(summary.firstEpoch) os << "first " << formatUTC(*summary.firstEpoch) << "\n";
