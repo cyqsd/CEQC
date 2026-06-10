@@ -1,0 +1,16 @@
+     3.05           OBSERVATION DATA    M                   RINEX VERSION / TYPE
+ceqc                ceqc                20260608 000000 UTC PGM / RUN BY / DATE
+TEST                                                        MARKER NAME
+USER                AGENCY                                  OBSERVER / AGENCY
+0001                GENERIC             1.0                 REC # / TYPE / VERS
+0001                GENERIC                                 ANT # / TYPE
+        0.0000        0.0000        0.0000                  APPROX POSITION XYZ
+        0.0000        0.0000        0.0000                  ANTENNA: DELTA H/E/N
+G    4 C1C L1C D1C S1C                                      SYS / # / OBS TYPES
+  2023     1     1     0     0    0.0000000     GPS         TIME OF FIRST OBS
+                                                            END OF HEADER
+> 2023 01 01 00 00 00.0000000  0  2
+G01  22345678.123  111111.123       -123.456        45.000
+G02  22345679.123  111112.123       -124.456        46.000
+> 2023 01 01 00 00 30.0000000  0  1
+G01  22345680.123  111113.123       -125.456        47.000
