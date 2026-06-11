@@ -441,16 +441,16 @@ void printQC(std::ostream& os,const ceqc::model::QCSummary& s,bool quiet,bool te
     if(s.derived->ceqcExtensionEnabled || s.derived->dataIndicatorsEnabled){ for(const auto& kv:s.derived->histogramSamples){ if(kv.first=="ion"||kv.first=="mp") continue; if(s.derived->histograms.find(kv.first)==s.derived->histograms.end()) os<<"ceqc-ext histogram "<<kv.first<<": skipped samples="<<kv.second<<"\n"; } for(const auto& kv:s.derived->histograms){ if(kv.first=="ion"||kv.first=="mp") continue; os<<"ceqc-ext histogram "<<kv.first<<": "<<histogramText(kv.second)<<" samples="<<(s.derived->histogramSamples.count(kv.first)?s.derived->histogramSamples.at(kv.first):0)<<"\n"; } }
     for(const auto& w:s.derived->thresholdWarnings) os<<"qc-threshold-warning: "<<w<<"\n";
     if(s.derived->position.skippedNoNavigation){ os<<"position-qc: skipped=no_navigation candidate_epochs="<<s.derived->position.candidateEpochs<<" min_svs="<<s.derived->minSVsUsed<<"\n"; }
-    else if(s.derived->position.attempted) { os<<"position-qc: solved="<<s.derived->position.epochSolutions<<" skipped="<<(s.derived->position.candidateEpochs-s.derived->position.epochSolutions)<<" min_svs="<<s.derived->minSVsUsed<<"\n"; if(s.derived->ceqcExtensionEnabled){ os<<"ceqc-ext position-qc: candidate_epochs="<<s.derived->position.candidateEpochs<<" skipped_insufficient_svs="<<s.derived->position.skippedInsufficientSVs<<" max_epoch_used_svs_by_system"; for(const char* sys : {"G","R","E","C","J"}){ auto it=s.derived->position.usedSVsBySystem.find(sys); os<<" "<<sys<<"="<<(it==s.derived->position.usedSVsBySystem.end()?0:it->second); } os<<"\n"; } }
+    else if(s.derived->position.attempted) { os<<"position-qc: solved="<<s.derived->position.epochSolutions<<" skipped="<<(s.derived->position.candidateEpochs-s.derived->position.epochSolutions)<<" min_svs="<<s.derived->minSVsUsed<<"\n"; if(s.derived->ceqcExtensionEnabled){ os<<"ceqc-ext position-qc: candidate_epochs="<<s.derived->position.candidateEpochs<<" numeric_solutions="<<s.derived->position.epochNumericSolutions<<" accepted="<<s.derived->position.epochSolutions<<" skipped_insufficient_svs="<<s.derived->position.skippedInsufficientSVs<<" rejected_bad_residual="<<s.derived->position.rejectedBadResidual<<" rejected_bad_height="<<s.derived->position.rejectedBadHeight<<" rejected_bad_jump="<<s.derived->position.rejectedBadJump<<" rejected_bad_geometry="<<s.derived->position.rejectedBadGeometry<<" max_epoch_used_svs_by_system"; for(const char* sys : {"G","R","E","C","J"}){ auto it=s.derived->position.usedSVsBySystem.find(sys); os<<" "<<sys<<"="<<(it==s.derived->position.usedSVsBySystem.end()?0:it->second); } os<<" gates_rms_m="<<s.derived->position.residualRmsGateM<<" gates_max_m="<<s.derived->position.residualMaxGateM<<"\n"; for(const auto& w:s.derived->position.warnings) os<<"ceqc-ext position-warning: "<<w<<"\n"; } }
     if((s.derived->everyEpochXYZ||s.derived->everyEpochGeodetic||s.derived->everyEpochDecimal) && !s.derived->epochPositions.empty()){
       os<<"every-epoch-position:\n";
       for(const auto& ep:s.derived->epochPositions){
         os<<"  "<<ep.time<<" sv="<<ep.usedSVs<<" status="<<ep.status;
-        if(ep.status=="OK"){
-          if(s.derived->epochPositions.size()>200 && (&ep-&s.derived->epochPositions.front())>=200){ os<<" ... truncated\n"; break; }
+        if(s.derived->epochPositions.size()>200 && (&ep-&s.derived->epochPositions.front())>=200){ os<<" ... truncated\n"; break; }
+        if(ep.status=="OK" || ep.status.rfind("REJECT_",0)==0){
           if(s.derived->everyEpochXYZ || (!s.derived->everyEpochGeodetic && !s.derived->everyEpochDecimal)) os<<" xyz="<<std::fixed<<std::setprecision(4)<<ep.x<<","<<ep.y<<","<<ep.z;
           if(s.derived->everyEpochGeodetic || s.derived->everyEpochDecimal) os<<" llh="<<std::setprecision(s.derived->everyEpochDecimal?9:6)<<ep.latDeg<<","<<ep.lonDeg<<","<<std::setprecision(4)<<ep.heightM;
-          os<<" clk_m="<<std::setprecision(4)<<ep.clockBiasM;
+          os<<" clk_m="<<std::setprecision(4)<<ep.clockBiasM<<" postfit_rms_m="<<std::setprecision(3)<<ep.postfitRmsM<<" max_res_m="<<ep.maxResidualM;
         }
         os<<"\n";
       }
@@ -489,9 +489,11 @@ void printQC(std::ostream& os,const ceqc::model::QCSummary& s,bool quiet,bool te
       os<<"ceqc-ext residual-qc no_ephemeris_by_system:"; for(const char* sys : {"G","R","E","C","J"}){ auto it=s.residuals->skippedNoEphemerisBySystem.find(sys); os<<" "<<sys<<"="<<(it==s.residuals->skippedNoEphemerisBySystem.end()?0:it->second); } os<<"\n";
       os<<"ceqc-ext residual-qc no_pseudorange_by_system:"; for(const char* sys : {"G","R","E","C","J"}){ auto it=s.residuals->skippedNoPseudorangeBySystem.find(sys); os<<" "<<sys<<"="<<(it==s.residuals->skippedNoPseudorangeBySystem.end()?0:it->second); } os<<"\n";
       os<<"ceqc-ext code-minus-range-no-clock-meters: mean="<<s.residuals->rawMeanMeters<<" rms="<<s.residuals->rawRmsMeters<<" max_abs="<<s.residuals->rawMaxAbsMeters<<"\n";
-      os<<"ceqc-ext residual-bias-removed-meters: mean="<<s.residuals->meanMeters<<" rms="<<s.residuals->rmsMeters<<" max_abs="<<s.residuals->maxAbsMeters<<"\n";
+      os<<"ceqc-ext residual-epoch-centered-meters: mean="<<s.residuals->meanMeters<<" rms="<<s.residuals->rmsMeters<<" max_abs="<<s.residuals->maxAbsMeters<<"\n";
+      os<<"ceqc-ext diagnostic-satellite-bias-removed-meters: mean="<<s.residuals->satBiasRemovedMeanMeters<<" rms="<<s.residuals->satBiasRemovedRmsMeters<<" max_abs="<<s.residuals->satBiasRemovedMaxAbsMeters<<"\n";
       for(const auto& kv:s.residuals->rawBySystem) os<<"ceqc-ext code-minus-range-no-clock-system "<<kv.first<<": n="<<kv.second.count<<" mean="<<kv.second.mean<<" rms="<<kv.second.rms<<"\n";
-      for(const auto& kv:s.residuals->biasRemovedBySystem) os<<"ceqc-ext residual-bias-removed-system "<<kv.first<<": n="<<kv.second.count<<" mean="<<kv.second.mean<<" rms="<<kv.second.rms<<"\n";
+      for(const auto& kv:s.residuals->biasRemovedBySystem) os<<"ceqc-ext residual-epoch-centered-system "<<kv.first<<": n="<<kv.second.count<<" mean="<<kv.second.mean<<" rms="<<kv.second.rms<<"\n";
+      for(const auto& kv:s.residuals->satBiasRemovedBySystem) os<<"ceqc-ext diagnostic-satellite-bias-removed-system "<<kv.first<<": n="<<kv.second.count<<" mean="<<kv.second.mean<<" rms="<<kv.second.rms<<"\n";
       for(auto& w:s.residuals->warnings) os<<"ceqc-ext residual-warning: "<<w<<"\n";
     }
   }

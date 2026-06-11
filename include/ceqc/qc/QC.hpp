@@ -15,18 +15,29 @@ struct QCPositionSummary {
   bool attempted=false;
   bool skippedNoNavigation=false;
   int candidateEpochs=0;
+  // Accepted, quality-gated epoch solutions.  This is the value printed as solved=.
   int epochSolutions=0;
+  // Numerically converged epochs before residual/height/jump quality gates.
+  int epochNumericSolutions=0;
   int skippedInsufficientSVs=0;
+  int rejectedBadResidual=0;
+  int rejectedBadHeight=0;
+  int rejectedBadJump=0;
+  int rejectedBadGeometry=0;
   double averageXYZ[3]{0,0,0};
   double approxXYZ[3]{0,0,0};
   bool hasApprox=false;
-  // Maximum number of unique SVs used by system in any single solved epoch.
+  double residualRmsGateM=50.0;
+  double residualMaxGateM=300.0;
+  double jumpGateM=250.0;
+  // Maximum number of unique SVs used by system in any single accepted epoch.
   std::map<std::string,int> usedSVsBySystem;
+  std::map<std::string,int> rejectedByStatus;
   std::vector<std::string> warnings;
 };
 struct QCRiseSetEvent { std::string satellite; std::string first; std::string last; double durationHours=0.0; double maxElevationDeg=std::numeric_limits<double>::quiet_NaN(); bool hasEphemeris=false; int obsCount=0; };
 struct QCDataCompleteness { int completeRecords=0; int partialRecords=0; int missingValues=0; int yCodeObservations=0; };
-struct QCEpochPosition { std::string time; double x=0,y=0,z=0; double latDeg=0,lonDeg=0,heightM=0; double clockBiasM=0; int usedSVs=0; std::string status; };
+struct QCEpochPosition { std::string time; double x=0,y=0,z=0; double latDeg=0,lonDeg=0,heightM=0; double clockBiasM=0; double postfitRmsM=0, maxResidualM=0; int usedSVs=0; std::string status; };
 struct QCDerivedSummary {
   std::vector<std::string> optionsActive; bool ionEnabled=true, iodEnabled=true, multipathEnabled=true, snrEnabled=true, lliEnabled=true, pseudorangePhaseEnabled=false, clockSlipsEnabled=true, plotEnabled=false; int epochSVMin=0; int epochSVMax=0; double epochSVMean=0;
   std::vector<QCGapEvent> gapEvents; int lliCount=0; int clockSlipCount=0; std::vector<QCSlipEvent> slipEvents;
@@ -59,6 +70,8 @@ struct ResidualStats {
   std::map<std::string,int> skippedNoEphemerisBySystem;
   std::map<std::string,int> skippedNoPseudorangeBySystem;
   std::map<std::string,QCMetricStats> rawBySystem, biasRemovedBySystem;
+  double satBiasRemovedMeanMeters=0, satBiasRemovedRmsMeters=0, satBiasRemovedMaxAbsMeters=0;
+  std::map<std::string,QCMetricStats> satBiasRemovedBySystem;
   std::vector<std::string> warnings;
 };
 struct QCOptions {

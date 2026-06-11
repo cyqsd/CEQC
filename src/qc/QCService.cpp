@@ -8,6 +8,7 @@
 #include <set>
 #include <optional>
 #include <sstream>
+#include <iomanip>
 #include <deque>
 
 namespace ceqc::service::qc {
@@ -15,6 +16,39 @@ namespace {
 constexpr double C = 299792458.0;
 constexpr double OMEGA_E = 7.2921151467e-5;
 constexpr double PI = 3.141592653589793238462643383279502884;
+
+// Internal observation epochs are read on the observation file time scale.  The
+// uploaded RTCM/RINEX test set declares GPS time for OBS, while BDS D1/D2
+// ephemerides use BDT and GLONASS FDMA ephemerides use UTC(SU)/UTC-like epochs.
+// For broadcast propagation and Toe/Toc matching we must compare on the
+// constellation navigation time scale; otherwise BDS is propagated 14 s too late
+// and GLONASS about 18 s too late, which produces kilometre-level residuals.
+constexpr double BDS_MINUS_GPS_SEC = -14.0;  // BDT = GPST - 14 s.
+TimePoint shiftSeconds(TimePoint t, double sec){
+  return t + std::chrono::duration_cast<TimePoint::duration>(std::chrono::duration<double>(sec));
+}
+int gpsMinusUtcSeconds(TimePoint gpsLikeTime){
+  struct LeapEntry { TimePoint effective; int offset; };
+  static const LeapEntry leaps[] = {
+    {makeUTC(1981,7,1,0,0,0.0),1}, {makeUTC(1982,7,1,0,0,0.0),2},
+    {makeUTC(1983,7,1,0,0,0.0),3}, {makeUTC(1985,7,1,0,0,0.0),4},
+    {makeUTC(1988,1,1,0,0,0.0),5}, {makeUTC(1990,1,1,0,0,0.0),6},
+    {makeUTC(1991,1,1,0,0,0.0),7}, {makeUTC(1992,7,1,0,0,0.0),8},
+    {makeUTC(1993,7,1,0,0,0.0),9}, {makeUTC(1994,7,1,0,0,0.0),10},
+    {makeUTC(1996,1,1,0,0,0.0),11}, {makeUTC(1997,7,1,0,0,0.0),12},
+    {makeUTC(1999,1,1,0,0,0.0),13}, {makeUTC(2006,1,1,0,0,0.0),14},
+    {makeUTC(2009,1,1,0,0,0.0),15}, {makeUTC(2012,7,1,0,0,0.0),16},
+    {makeUTC(2015,7,1,0,0,0.0),17}, {makeUTC(2017,1,1,0,0,0.0),18},
+  };
+  int out=0;
+  for(const auto& e:leaps) if(gpsLikeTime>=e.effective) out=e.offset;
+  return out;
+}
+TimePoint navScaleTimeFromObsTime(TimePoint obsTime, const std::string& system){
+  if(system=="C") return shiftSeconds(obsTime, BDS_MINUS_GPS_SEC);
+  if(system=="R") return shiftSeconds(obsTime, -static_cast<double>(gpsMinusUtcSeconds(obsTime)));
+  return obsTime;
+}
 
 template<class T> double mean(const std::vector<T>& v){ if(v.empty()) return 0; return std::accumulate(v.begin(),v.end(),0.0)/static_cast<double>(v.size()); }
 QCMetricStats stat(const std::vector<double>& x){ QCMetricStats s; s.count=(int)x.size(); if(x.empty())return s; s.min=*std::min_element(x.begin(),x.end()); s.max=*std::max_element(x.begin(),x.end()); s.mean=mean(x); double ss=0; for(auto v:x)ss+=v*v; s.rms=std::sqrt(ss/x.size()); return s; }
@@ -124,11 +158,50 @@ std::optional<double> firstPseudorange(const ObservationRecord& r){
   if(best) return *best->value;
   return {};
 }
-std::optional<NavigationRecord> nearestEph(const std::vector<NavigationRecord>& navs,const std::string& sat,TimePoint t,const QCOptions& opt){ double best=std::numeric_limits<double>::infinity(); std::optional<NavigationRecord> out; std::string sys=sat.empty()?"":sat.substr(0,1); if(opt.noOrbitSystems.count(sys) && opt.noOrbitSystems.at(sys)) return {}; for(auto& n:navs){ if(n.satellite!=sat || !n.epoch || n.fields.empty()) continue; double dt=std::fabs(std::chrono::duration<double>(t-*n.epoch).count()); if(dt<best){best=dt; out=n;} } if(best>6*3600) return {}; return out; }
+bool orbitUsable(const NavigationRecord& n){
+  auto explicitFlag=n.fields.find("OrbitUsable");
+  if(explicitFlag!=n.fields.end() && (!std::isfinite(explicitFlag->second.value) || explicitFlag->second.value <= 0.5)) return false;
+  if(n.system=="G" || n.system=="J" || n.system=="E" || n.system=="C") {
+    auto a=f(n,"SqrtA"), toe=f(n,"Toe"), m0=f(n,"M0"), ecc=f(n,"Eccentricity");
+    if(!a || !toe || !m0 || !ecc) return false;
+    if(!std::isfinite(*a) || *a < 5000.0 || *a > 7000.0) return false;
+    if(!std::isfinite(*toe) || *toe < 0.0 || *toe >= 604800.0) return false;
+    if(!std::isfinite(*ecc) || *ecc < 0.0 || *ecc >= 1.0) return false;
+  }
+  return true;
+}
+std::optional<NavigationRecord> nearestEph(const std::vector<NavigationRecord>& navs,const std::string& sat,TimePoint t,const QCOptions& opt){
+  double best=std::numeric_limits<double>::infinity();
+  std::optional<NavigationRecord> out;
+  std::string sys=sat.empty()?"":sat.substr(0,1);
+  if(opt.noOrbitSystems.count(sys) && opt.noOrbitSystems.at(sys)) return {};
+  TimePoint navTime = navScaleTimeFromObsTime(t, sys);
+  for(auto& n:navs){
+    if(n.satellite!=sat || !n.epoch || n.fields.empty() || !orbitUsable(n)) continue;
+    TimePoint cmpTime = navScaleTimeFromObsTime(t, n.system);
+    double refdt=std::fabs(std::chrono::duration<double>(cmpTime-*n.epoch).count());
+    double dt=refdt;
+    if(auto toe=f(n,"Toe")){
+      double sow=0.0;
+      if(n.system=="E") sow=std::fmod(std::max(0.0,std::chrono::duration<double>(cmpTime-makeUTC(1999,8,22,0,0,0.0)).count()),604800.0);
+      else if(n.system=="C") sow=std::fmod(std::max(0.0,std::chrono::duration<double>(cmpTime-makeUTC(2006,1,1,0,0,0.0)).count()),604800.0);
+      else sow=std::fmod(std::max(0.0,std::chrono::duration<double>(cmpTime-makeUTC(1980,1,6,0,0,0.0)).count()),604800.0);
+      double toeDt=sow-*toe;
+      while(toeDt>302400.0) toeDt-=604800.0;
+      while(toeDt<-302400.0) toeDt+=604800.0;
+      dt=std::min(refdt,std::fabs(toeDt));
+    }
+    if(dt<best){best=dt; out=n;}
+  }
+  (void)navTime;
+  if(best>6*3600) return {};
+  return out;
+}
 double median(std::vector<double> v){ if(v.empty()) return 0; std::sort(v.begin(),v.end()); auto n=v.size(); if(n%2) return v[n/2]; return 0.5*(v[n/2-1]+v[n/2]); }
 double norm3(const std::array<double,3>& a,const std::array<double,3>& b){ double dx=a[0]-b[0],dy=a[1]-b[1],dz=a[2]-b[2]; return std::sqrt(dx*dx+dy*dy+dz*dz); }
 struct SatState{ std::array<double,3> xyz{}; double clk=0; bool ok=false; };
 double dtSeconds(TimePoint a,TimePoint b){ return std::chrono::duration<double>(a-b).count(); }
+std::array<double,3> sagnac(const std::array<double,3>& x,double tau);
 SatState propKepler(const NavigationRecord& e,TimePoint t){
   auto sqrtA=f(e,"SqrtA"); if(!sqrtA||!*sqrtA||!e.epoch) return {}; double mu=(e.system=="E"||e.system=="C"||e.system=="I")?3.986004418e14:3.986005e14; double A=(*sqrtA)*(*sqrtA);
   double tk=dtSeconds(t,*e.epoch); while(tk>302400)tk-=604800; while(tk<-302400)tk+=604800; double toe=f(e,"Toe").value_or(0);
@@ -201,6 +274,25 @@ SatState propGLO(const NavigationRecord& e,TimePoint t){
   return {s.r,clk,std::isfinite(s.r[0])&&std::isfinite(s.r[1])&&std::isfinite(s.r[2])};
 }
 SatState prop(const NavigationRecord& e,TimePoint t){ if(e.system=="R") return propGLO(e,t); return propKepler(e,t); }
+SatState propagateForPseudorange(const NavigationRecord& e,
+                                 TimePoint rxTime,
+                                 double pseudorange,
+                                 const std::array<double,3>& rxXYZ,
+                                 double& tauOut){
+  double tau = pseudorange / C;
+  SatState ss;
+  TimePoint navRxTime = navScaleTimeFromObsTime(rxTime, e.system);
+  for(int i=0;i<3;++i){
+    auto tx = navRxTime - std::chrono::duration_cast<std::chrono::system_clock::duration>(
+      std::chrono::duration<double>(tau));
+    ss = prop(e, tx);
+    if(!ss.ok) break;
+    auto rot = sagnac(ss.xyz, tau);
+    tau = norm3(rot, rxXYZ) / C;
+  }
+  tauOut = tau;
+  return ss;
+}
 std::array<double,3> sagnac(const std::array<double,3>& x,double tau){ double a=OMEGA_E*tau; double ca=std::cos(a),sa=std::sin(a); return {ca*x[0]+sa*x[1],-sa*x[0]+ca*x[1],x[2]}; }
 std::array<double,3> llhFromXYZ(const std::array<double,3>& xyz){
   const double a=6378137.0, f0=1.0/298.257223563, e2=f0*(2-f0);
@@ -230,7 +322,11 @@ double obsValue(const ObservationRecord& r, char kind, char band){
 bool hasObsValue(const ObservationRecord& r, char kind, char band){ return std::isfinite(obsValue(r,kind,band)); }
 double signalFrequencyHz(const std::string& system, char band, const NavigationRecord* eph=nullptr){
   if(system=="R"){
-    int k=0; if(eph){ auto fk=f(*eph,"FrequencyNumber"); if(fk) k=(int)std::lround(*fk); }
+    // GLONASS FDMA wavelengths depend on the satellite frequency channel.  If
+    // no navigation record/header slot is available, do not guess k=0 because
+    // that creates false tens-of-metres MP values in OBS-only QC.
+    if(!eph) return 0.0;
+    int k=0; auto fk=f(*eph,"FrequencyNumber"); if(fk) k=(int)std::lround(*fk);
     if(band=='1') return (1602.0 + 0.5625*k)*1e6;
     if(band=='2') return (1246.0 + 0.4375*k)*1e6;
     return 0.0;
@@ -386,7 +482,62 @@ bool isReferenceClockSystem(const std::string& sys, const std::string& ref){
   return sys==ref;
 }
 
-std::optional<std::array<double,4>> solveEpochPosition(const std::vector<ObservationRecord>& records,
+bool systemDisabledForPosition(const QCOptions& opt, const std::string& sys){
+  auto it=opt.noPositionSystems.find(sys);
+  return it!=opt.noPositionSystems.end() && it->second;
+}
+
+struct EpochPositionSolution {
+  std::array<double,4> state{};
+  double postfitRmsM=std::numeric_limits<double>::infinity();
+  double maxResidualM=std::numeric_limits<double>::infinity();
+  int usedSVs=0;
+  std::map<std::string,std::set<std::string>> usedBySystem;
+};
+
+struct SystemScreenResult {
+  std::map<std::string,double> centeredRmsBySystem;
+  std::map<std::string,int> countBySystem;
+  std::map<std::string,bool> excludeFromPosition;
+};
+
+SystemScreenResult screenPositionSystems(const RinexFile& rf, const std::vector<NavigationRecord>& navs, const std::array<double,3>& rx, const QCOptions& opt){
+  SystemScreenResult out;
+  IonoModel iono=ionoModelFromNavs(navs);
+  std::map<std::string,std::vector<double>> residuals;
+  for(const auto& rec:rf.data.observationRecords){
+    if(systemDisabledForPosition(opt, rec.system)) continue;
+    auto pr=firstPseudorange(rec); if(!pr) continue;
+    auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph) continue;
+    double tau=0.0;
+    auto ss=propagateForPseudorange(*eph, rec.time, *pr, rx, tau); if(!ss.ok) continue;
+    auto sx=sagnac(ss.xyz,tau);
+    double rho=norm3(sx,rx); if(!std::isfinite(rho) || rho<=1.0) continue;
+    double el=elevationRad(rx,sx);
+    double res=*pr - (rho + tropoDelayMeters(rx,el) + ionoDelayMeters(rx,sx,rec.time,rec.system,iono) - C*ss.clk);
+    if(std::isfinite(res)) residuals[rec.system].push_back(res);
+  }
+  for(auto& kv:residuals){
+    out.countBySystem[kv.first]=static_cast<int>(kv.second.size());
+    if(kv.second.size()<20) continue;
+    double med=median(kv.second);
+    std::vector<double> centered; centered.reserve(kv.second.size());
+    for(double v:kv.second) centered.push_back(v-med);
+    auto st=stat(centered);
+    double maxAbs=std::max(std::fabs(st.min), std::fabs(st.max));
+    out.centeredRmsBySystem[kv.first]=st.rms;
+    // GPS/QZSS are retained unless they are wildly broken.  Other systems are
+    // admitted to the SPP only after their broadcast propagation/code model has
+    // metre-to-tens-of-metres scatter.  This prevents kilometre-level BDS/GLO
+    // model errors from being hidden inside receiver clock or ISB estimates.
+    double rmsGate = (kv.first=="G" || kv.first=="J") ? 150.0 : 80.0;
+    double maxGate = (kv.first=="G" || kv.first=="J") ? 800.0 : 500.0;
+    if(st.rms > rmsGate || maxAbs > maxGate) out.excludeFromPosition[kv.first]=true;
+  }
+  return out;
+}
+
+std::optional<EpochPositionSolution> solveEpochPosition(const std::vector<ObservationRecord>& records,
                                                        const std::vector<NavigationRecord>& navs,
                                                        const std::array<double,3>& seed,
                                                        const QCOptions& opt,
@@ -412,6 +563,24 @@ std::optional<std::array<double,4>> solveEpochPosition(const std::vector<Observa
   if(nState>8) return {};
   std::vector<double> state(nState,0.0);
   state[0]=seed[0]; state[1]=seed[1]; state[2]=seed[2]; state[3]=0.0;
+  {
+    std::vector<double> clkGuess;
+    std::array<double,3> rx{state[0],state[1],state[2]};
+    for(const auto& rec:records){
+      if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue;
+      auto pr=firstPseudorange(rec); if(!pr) continue;
+      auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph) continue;
+      double tau=0.0;
+      auto ss=propagateForPseudorange(*eph, rec.time, *pr, rx, tau); if(!ss.ok) continue;
+      auto sx=sagnac(ss.xyz,tau);
+      double rho=norm3(sx,rx); if(rho<=1.0 || !std::isfinite(rho)) continue;
+      double el=elevationRad(rx,sx);
+      double trop=tropoDelayMeters(rx,el);
+      double ion=ionoDelayMeters(rx,sx,rec.time,rec.system,iono);
+      clkGuess.push_back(*pr - (rho + trop + ion - C*ss.clk));
+    }
+    if(clkGuess.size() >= 4) state[3]=median(clkGuess);
+  }
   std::vector<char> active(records.size(),1);
   for(int pass=0; pass<2; ++pass){
     for(int iter=0; iter<10; ++iter){
@@ -424,11 +593,10 @@ std::optional<std::array<double,4>> solveEpochPosition(const std::vector<Observa
         if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue;
         auto pr=firstPseudorange(rec); if(!pr) continue;
         auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph) continue;
-        double tau=*pr/C;
-        auto tx=rec.time-std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(tau));
-        auto ss=prop(*eph,tx); if(!ss.ok) continue;
-        auto sx=sagnac(ss.xyz,tau);
         std::array<double,3> rx{state[0],state[1],state[2]};
+        double tau=0.0;
+        auto ss=propagateForPseudorange(*eph, rec.time, *pr, rx, tau); if(!ss.ok) continue;
+        auto sx=sagnac(ss.xyz,tau);
         double rho=norm3(sx,rx); if(rho<=1.0 || !std::isfinite(rho)) continue;
         double el=elevationRad(rx,sx);
         if(std::isfinite(el) && el < -0.05) continue;
@@ -440,7 +608,6 @@ std::optional<std::array<double,4>> solveEpochPosition(const std::vector<Observa
         auto bit=biasIndex.find(rec.system);
         if(bit!=biasIndex.end()){ h[bit->second]=1.0; bias=state[bit->second]; }
         double v=*pr - (rho + trop + ion - C*ss.clk + state[3] + bias);
-        if(iter>2 && std::fabs(v)>1000.0) continue;
         double sig=1.0;
         if(std::isfinite(el) && el>0.0) sig=1.0/std::max(0.25,std::sin(el));
         double w=1.0/(sig*sig);
@@ -458,15 +625,44 @@ std::optional<std::array<double,4>> solveEpochPosition(const std::vector<Observa
     if(pass==0){
       std::vector<double> res; std::vector<size_t> idx;
       for(size_t ri=0; ri<records.size(); ++ri){
-        const auto& rec=records[ri]; auto pr=firstPseudorange(rec); if(!pr) continue; auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph) continue;
-        double tau=*pr/C; auto tx=rec.time-std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(tau)); auto ss=prop(*eph,tx); if(!ss.ok) continue; auto sx=sagnac(ss.xyz,tau);
-        std::array<double,3> rx{state[0],state[1],state[2]}; double rho=norm3(sx,rx); if(rho<=1.0) continue; double el=elevationRad(rx,sx); double bias=0.0; auto bit=biasIndex.find(rec.system); if(bit!=biasIndex.end()) bias=state[bit->second];
+        const auto& rec=records[ri]; if(systemDisabledForPosition(opt, rec.system)) continue; auto pr=firstPseudorange(rec); if(!pr) continue; auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph) continue;
+        std::array<double,3> rx{state[0],state[1],state[2]};
+        double tau=0.0; auto ss=propagateForPseudorange(*eph, rec.time, *pr, rx, tau); if(!ss.ok) continue; auto sx=sagnac(ss.xyz,tau);
+        double rho=norm3(sx,rx); if(rho<=1.0) continue; double el=elevationRad(rx,sx); double bias=0.0; auto bit=biasIndex.find(rec.system); if(bit!=biasIndex.end()) bias=state[bit->second];
         double v=*pr-(rho+tropoDelayMeters(rx,el)+ionoDelayMeters(rx,sx,rec.time,rec.system,iono)-C*ss.clk+state[3]+bias); res.push_back(v); idx.push_back(ri);
       }
       if(res.size()>nState+2){ double med=median(res); std::vector<double> dev; for(double v:res) dev.push_back(std::fabs(v-med)); double mad=median(dev); double gate=std::max(60.0, 6.0*1.4826*mad); for(size_t i=0;i<res.size();++i) if(std::fabs(res[i]-med)>gate) active[idx[i]]=0; }
     }
   }
-  return std::array<double,4>{state[0],state[1],state[2],state[3]};
+
+  EpochPositionSolution sol;
+  sol.state={state[0],state[1],state[2],state[3]};
+  std::vector<double> finalResiduals;
+  for(size_t ri=0; ri<records.size(); ++ri){
+    if(!active[ri]) continue;
+    const auto& rec=records[ri];
+    if(systemDisabledForPosition(opt, rec.system)) continue;
+    auto pr=firstPseudorange(rec); if(!pr) continue;
+    auto eph=nearestEph(navs,rec.satellite,rec.time,opt); if(!eph) continue;
+    std::array<double,3> rx{state[0],state[1],state[2]};
+    double tau=0.0;
+    auto ss=propagateForPseudorange(*eph, rec.time, *pr, rx, tau); if(!ss.ok) continue;
+    auto sx=sagnac(ss.xyz,tau);
+    double rho=norm3(sx,rx); if(rho<=1.0 || !std::isfinite(rho)) continue;
+    double el=elevationRad(rx,sx);
+    if(std::isfinite(el) && el < -0.05) continue;
+    double bias=0.0; auto bit=biasIndex.find(rec.system); if(bit!=biasIndex.end()) bias=state[bit->second];
+    double v=*pr-(rho+tropoDelayMeters(rx,el)+ionoDelayMeters(rx,sx,rec.time,rec.system,iono)-C*ss.clk+state[3]+bias);
+    if(!std::isfinite(v)) continue;
+    finalResiduals.push_back(v);
+    sol.usedBySystem[rec.system].insert(rec.satellite);
+  }
+  sol.usedSVs=static_cast<int>(finalResiduals.size());
+  if(sol.usedSVs<nState) return {};
+  auto rst=stat(finalResiduals);
+  sol.postfitRmsM=rst.rms;
+  sol.maxResidualM=std::max(std::fabs(rst.min), std::fabs(rst.max));
+  return sol;
 }
 
 std::optional<std::array<double,3>> estimateApproxPositionInternal(const RinexFile& rf, const std::vector<NavigationRecord>& navs, const QCOptions& opt){
@@ -496,7 +692,7 @@ std::optional<std::array<double,3>> estimateApproxPositionInternal(const RinexFi
     for(const auto& seed:seeds){
       auto sol=solveEpochPosition(kv.second, navs, seed, opt, iono);
       if(!sol) continue;
-      std::array<double,3> xyz{(*sol)[0],(*sol)[1],(*sol)[2]};
+      std::array<double,3> xyz{sol->state[0],sol->state[1],sol->state[2]};
       double nr=std::sqrt(xyz[0]*xyz[0]+xyz[1]*xyz[1]+xyz[2]*xyz[2]);
       if(!std::isfinite(nr) || nr<6.0e6 || nr>7.0e6) continue;
       auto llh=llhFromXYZ(xyz);
@@ -621,8 +817,11 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
   std::vector<int> positionEligibleBins(width,0);
   std::set<std::string> observedSats;
   std::set<int> unhealthyGPS;
-  std::map<std::string,bool> hasNav;
-  for(const auto& n:navs){ if(!n.satellite.empty()) hasNav[n.satellite]=true; if(n.satellite.size()>1 && n.satellite[0]=='G'){ auto h=f(n,"SVHealth"); if(h && std::lround(*h)!=0) unhealthyGPS.insert(prnNumber(n.satellite)); } }
+  std::map<std::string,bool> hasUsableNav;
+  for(const auto& n:navs){
+    if(!n.satellite.empty() && orbitUsable(n)) hasUsableNav[n.satellite]=true;
+    if(n.satellite.size()>1 && n.satellite[0]=='G'){ auto h=f(n,"SVHealth"); if(h && std::lround(*h)!=0) unhealthyGPS.insert(prnNumber(n.satellite)); }
+  }
   for(const auto& r:rf.data.observationRecords){
     observedSats.insert(r.satellite);
     obsBySatBin[r.satellite].resize(width,0); lliBySatBin[r.satellite].resize(width,0); incompleteBySatBin[r.satellite].resize(width,0); mpBySatBin[r.satellite].resize(width,0.0);
@@ -672,7 +871,7 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
     bool lli=false; bool hasL1=false,hasL2=false,hasP1=false,hasP2=false;
     for(const auto& v:r.values){ if(!v.lli.empty()) lli=true; if(v.value && v.type.size()>=2){ if(v.type[0]=='L'&&v.type[1]=='1')hasL1=true; if(v.type[0]=='L'&&v.type[1]=='2')hasL2=true; if((v.type[0]=='C'||v.type[0]=='P')&&v.type[1]=='1')hasP1=true; if((v.type[0]=='C'||v.type[0]=='P')&&v.type[1]=='2')hasP2=true; } }
     if(r.satellite.size()>1 && r.satellite[0]=='G' && unhealthyGPS.count(prnNumber(r.satellite))) sym='\'';
-    else if(!hasNav.count(r.satellite)) sym = lli ? 'L' : 'N';
+    else if(!hasUsableNav.count(r.satellite)) sym = lli ? 'L' : 'N';
     else if(lli) sym='L';
     else if(hasP1 && (!hasL1 || !hasP2 || !hasL2)) sym='2';
     rows[r.satellite][b]=mergeTeqcSymbol(rows[r.satellite][b], sym);
@@ -701,7 +900,9 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
   int minForPos=std::max(4,opt.minSVs);
   for(int b=0;b<width;++b){
     if(b >= (int)obsBins.size() || obsBins[b] == 0){ navRow.push_back('g'); posRow.push_back('g'); continue; }
-    if(navMissingBins[b] > 0) navRow.push_back('N'); else if(navCandidateBins[b] > 0) navRow.push_back('+'); else navRow.push_back('n');
+    if(navCandidateBins[b] > 0) navRow.push_back('+');
+    else if(navMissingBins[b] > 0) navRow.push_back('N');
+    else navRow.push_back('n');
     if(positionEligibleBins[b] >= minForPos) posRow.push_back('P'); else posRow.push_back('s');
   }
   d.obsBinCounts=obsBins; d.obsTimeplot=obsRow; d.navTimeplot=navRow; d.positionTimeplot=posRow; d.timeplot="|"+d.obsTimeplot+"|";
@@ -711,17 +912,45 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
 void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRecord>& navs, const QCOptions& opt, QCSummary& s){
   if(!s.derived) s.derived=QCDerivedSummary{};
   QCDerivedSummary& d=*s.derived;
+  const double obsOnlyMp1Meters = d.mp1Meters;
+  const double obsOnlyMp2Meters = d.mp2Meters;
+  const auto obsOnlyMultipathStats = d.multipathStats;
+  const auto obsOnlyMultipathMovingRMS = d.multipathMovingRMS;
+  const auto obsOnlyMultipathMovingCount = d.multipathMovingCount;
+  QCOptions posOpt=opt;
   auto recXYZ=approxXYZ(rf.header);
-  if(!recXYZ || std::sqrt((*recXYZ)[0]*(*recXYZ)[0]+(*recXYZ)[1]*(*recXYZ)[1]+(*recXYZ)[2]*(*recXYZ)[2]) < 1.0e6) recXYZ=estimateApproxPositionInternal(rf, navs, opt);
+  if(!recXYZ || std::sqrt((*recXYZ)[0]*(*recXYZ)[0]+(*recXYZ)[1]*(*recXYZ)[1]+(*recXYZ)[2]*(*recXYZ)[2]) < 1.0e6){
+    // Bootstrap missing/zero station coordinates conservatively.  Do not let
+    // unverified BDS/GLO models pull the seed hundreds or thousands of metres.
+    QCOptions seedOpt=opt;
+    seedOpt.noPositionSystems["R"]=true;
+    seedOpt.noPositionSystems["C"]=true;
+    recXYZ=estimateApproxPositionInternal(rf, navs, seedOpt);
+  }
   if(!recXYZ){
     // Still build observation/navigation timeplots when NAV is present; only the
     // elevation/position rows are degraded.  This matches teqc's behaviour of
     // not hiding OBS/NAV availability just because station coordinates are absent.
     d.position.candidateEpochs=s.epochCount;
     d.position.warnings.push_back("no station coordinates; position row skipped");
-    buildTeqcTimeplotWithNav(rf, navs, opt, d);
+    buildTeqcTimeplotWithNav(rf, navs, posOpt, d);
     return;
   }
+
+  auto sysScreen=screenPositionSystems(rf,navs,*recXYZ,opt);
+  for(const auto& kv:sysScreen.excludeFromPosition){
+    if(kv.second){
+      posOpt.noPositionSystems[kv.first]=true;
+      std::ostringstream w;
+      w << "position-system-screen: " << kv.first << " excluded from SPP";
+      auto rit=sysScreen.centeredRmsBySystem.find(kv.first);
+      auto cit=sysScreen.countBySystem.find(kv.first);
+      if(rit!=sysScreen.centeredRmsBySystem.end()) w << " centered_rms=" << std::fixed << std::setprecision(2) << rit->second << " m";
+      if(cit!=sysScreen.countBySystem.end()) w << " samples=" << cit->second;
+      d.position.warnings.push_back(w.str());
+    }
+  }
+
   d.position.hasApprox=true;
   d.position.approxXYZ[0]=(*recXYZ)[0]; d.position.approxXYZ[1]=(*recXYZ)[1]; d.position.approxXYZ[2]=(*recXYZ)[2];
   d.position.averageXYZ[0]=(*recXYZ)[0]; d.position.averageXYZ[1]=(*recXYZ)[1]; d.position.averageXYZ[2]=(*recXYZ)[2];
@@ -741,10 +970,12 @@ void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRec
     double el=std::numeric_limits<double>::quiet_NaN();
     if(ephOpt){
       ephCache[rec.satellite]=*ephOpt; ephPtr=&ephCache[rec.satellite];
-      auto pr=firstPseudorange(rec); auto tx=rec.time;
-      if(pr) tx=rec.time-std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(*pr/C));
-      auto st=prop(*ephPtr,tx);
-      if(st.ok){ double tau=pr?*pr/C:0.07; auto sx=sagnac(st.xyz,tau); el=elevationRad(*recXYZ,sx); }
+      auto pr=firstPseudorange(rec);
+      if(pr){
+        double tau=0.0;
+        auto st=propagateForPseudorange(*ephPtr,rec.time,*pr,*recXYZ,tau);
+        if(st.ok){ auto sx=sagnac(st.xyz,tau); el=elevationRad(*recXYZ,sx); }
+      }
     }
     bool unhealthyForSnr = false;
     if(rec.satellite.size()>1 && rec.satellite[0]=='G' && ephOpt){
@@ -832,6 +1063,14 @@ void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRec
       d.multipathMovingCount[key]=st.count;
     }
   }
+  // MP is an observation-domain code/carrier combination.  NAV is used above
+  // for elevation/rise-set/position diagnostics only; do not let availability of
+  // broadcast ephemerides change the default MP RMS reported by +qcq.
+  d.mp1Meters = obsOnlyMp1Meters;
+  d.mp2Meters = obsOnlyMp2Meters;
+  d.multipathStats = obsOnlyMultipathStats;
+  d.multipathMovingRMS = obsOnlyMultipathMovingRMS;
+  d.multipathMovingCount = obsOnlyMultipathMovingCount;
   if(opt.multipath){
     auto checkMp=[&](const std::string& name, double rmsMeters){
       std::string key=name;
@@ -867,42 +1106,102 @@ void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRec
   for(int p=1;p<=32;++p){ if(!gpsObs.count(p)) d.gpsSVsWithoutObs.push_back(p); if(gpsObs.count(p)&&!gpsNav.count(p)) d.gpsSVsWithoutNav.push_back(p); if(gpsUnhealthy.count(p)) d.gpsUnhealthySVs.push_back(p); }
   for(int p=1;p<=24;++p){ if(!gloObs.count(p)) d.glonassSVsWithoutObs.push_back(p); if(gloObs.count(p)&&!gloNav.count(p)) d.glonassSVsWithoutNav.push_back(p); }
 
-  // Actual epoch-by-epoch single point position estimate.  The averaged solution
-  // is intentionally conservative (GPS/QZSS only unless inter-system bias states
-  // are added) and is not a sample-specific value.
+  // Actual epoch-by-epoch single point position estimate.  Numeric convergence is
+  // not enough: CEQC accepts an epoch only after post-fit residual, height and
+  // continuity gates pass.  Systems rejected by the residual screen above are
+  // not allowed to contaminate the mixed-constellation solution.
   d.position.hasApprox=true;
   d.position.approxXYZ[0]=(*recXYZ)[0]; d.position.approxXYZ[1]=(*recXYZ)[1]; d.position.approxXYZ[2]=(*recXYZ)[2];
+  d.position.residualRmsGateM=50.0;
+  d.position.residualMaxGateM=300.0;
+  d.position.jumpGateM=std::min(opt.positionJumpM, 250.0);
   std::map<std::string,std::vector<ObservationRecord>> byEpoch;
   for(const auto& r:rf.data.observationRecords) byEpoch[formatUTC(r.time)].push_back(r);
-  std::vector<std::array<double,4>> sols;
+  std::vector<std::array<double,4>> acceptedSols;
   d.position.candidateEpochs=static_cast<int>(byEpoch.size());
+  std::optional<std::array<double,3>> previousAccepted;
+  std::map<std::string,std::string> epochStatus;
   for(const auto& kv:byEpoch){
     int eligible=0;
-    for(const auto& rec:kv.second){ if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue; if(firstPseudorange(rec) && nearestEph(navs,rec.satellite,rec.time,opt)) ++eligible; }
-    if(eligible < std::max(4,opt.minSVs)){ d.position.skippedInsufficientSVs++; continue; }
-    if(auto sol=solveEpochPosition(kv.second, navs, *recXYZ, opt, iono)){
-      sols.push_back(*sol);
-      std::map<std::string,std::set<std::string>> usedBySystem;
-      for(const auto& rec:kv.second){
-        if(opt.noPositionSystems.count(rec.system) && opt.noPositionSystems.at(rec.system)) continue;
-        if(firstPseudorange(rec) && nearestEph(navs,rec.satellite,rec.time,opt)) usedBySystem[rec.system].insert(rec.satellite);
+    for(const auto& rec:kv.second){
+      if(systemDisabledForPosition(posOpt, rec.system)) continue;
+      if(firstPseudorange(rec) && nearestEph(navs,rec.satellite,rec.time,posOpt)) ++eligible;
+    }
+    if(eligible < std::max(4,posOpt.minSVs)){
+      d.position.skippedInsufficientSVs++;
+      epochStatus[kv.first]="INSUFFICIENT_SVS";
+      if(opt.everyEpochPosition){ QCEpochPosition ep; ep.time=kv.first; ep.usedSVs=eligible; ep.status="INSUFFICIENT_SVS"; d.epochPositions.push_back(ep); }
+      continue;
+    }
+    auto sol=solveEpochPosition(kv.second, navs, *recXYZ, posOpt, iono);
+    if(!sol){
+      d.position.rejectedBadGeometry++;
+      d.position.rejectedByStatus["NO_SOLUTION"]++;
+      epochStatus[kv.first]="NO_SOLUTION";
+      if(opt.everyEpochPosition){ QCEpochPosition ep; ep.time=kv.first; ep.usedSVs=eligible; ep.status="NO_SOLUTION"; d.epochPositions.push_back(ep); }
+      continue;
+    }
+    d.position.epochNumericSolutions++;
+    auto llh=llhFromXYZ({sol->state[0],sol->state[1],sol->state[2]});
+    std::string status="OK";
+    if(!std::isfinite(sol->postfitRmsM) || sol->postfitRmsM>d.position.residualRmsGateM || sol->maxResidualM>d.position.residualMaxGateM){
+      status="REJECT_BAD_RESIDUAL";
+      d.position.rejectedBadResidual++;
+    } else if(!std::isfinite(llh[2]) || llh[2]<opt.positionHMinM || llh[2]>opt.positionHMaxM){
+      status="REJECT_BAD_HEIGHT";
+      d.position.rejectedBadHeight++;
+    } else if(previousAccepted){
+      std::array<double,3> xyz{sol->state[0],sol->state[1],sol->state[2]};
+      double jump=norm3(xyz,*previousAccepted);
+      if(jump>d.position.jumpGateM){
+        status="REJECT_BAD_JUMP";
+        d.position.rejectedBadJump++;
       }
-      for(const auto& ukv:usedBySystem) d.position.usedSVsBySystem[ukv.first]=std::max(d.position.usedSVsBySystem[ukv.first], (int)ukv.second.size());
-      if(opt.everyEpochPosition){
-        auto llh=llhFromXYZ({(*sol)[0],(*sol)[1],(*sol)[2]});
-        QCEpochPosition ep; ep.time=kv.first; ep.x=(*sol)[0]; ep.y=(*sol)[1]; ep.z=(*sol)[2]; ep.latDeg=llh[0]*180.0/PI; ep.lonDeg=llh[1]*180.0/PI; ep.heightM=llh[2]; ep.clockBiasM=(*sol)[3]; ep.usedSVs=eligible; ep.status="OK";
-        d.epochPositions.push_back(ep);
-      }
-    } else if(opt.everyEpochPosition){
-      QCEpochPosition ep; ep.time=kv.first; ep.usedSVs=eligible; ep.status="NO_SOLUTION"; d.epochPositions.push_back(ep);
+    }
+
+    if(status=="OK"){
+      acceptedSols.push_back(sol->state);
+      previousAccepted=std::array<double,3>{sol->state[0],sol->state[1],sol->state[2]};
+      for(const auto& ukv:sol->usedBySystem) d.position.usedSVsBySystem[ukv.first]=std::max(d.position.usedSVsBySystem[ukv.first], (int)ukv.second.size());
+    } else {
+      d.position.rejectedByStatus[status]++;
+    }
+    epochStatus[kv.first]=status;
+    if(opt.everyEpochPosition){
+      QCEpochPosition ep;
+      ep.time=kv.first; ep.x=sol->state[0]; ep.y=sol->state[1]; ep.z=sol->state[2];
+      ep.latDeg=llh[0]*180.0/PI; ep.lonDeg=llh[1]*180.0/PI; ep.heightM=llh[2]; ep.clockBiasM=sol->state[3];
+      ep.postfitRmsM=sol->postfitRmsM; ep.maxResidualM=sol->maxResidualM; ep.usedSVs=sol->usedSVs; ep.status=status;
+      d.epochPositions.push_back(ep);
     }
   }
-  d.position.attempted=true; d.position.skippedNoNavigation=false; d.position.epochSolutions=static_cast<int>(sols.size());
-  if(!sols.empty()){
-    for(auto& sol:sols){ d.position.averageXYZ[0]+=sol[0]; d.position.averageXYZ[1]+=sol[1]; d.position.averageXYZ[2]+=sol[2]; }
-    d.position.averageXYZ[0]/=sols.size(); d.position.averageXYZ[1]/=sols.size(); d.position.averageXYZ[2]/=sols.size();
+  d.position.attempted=true; d.position.skippedNoNavigation=false; d.position.epochSolutions=static_cast<int>(acceptedSols.size());
+  if(!acceptedSols.empty()){
+    d.position.averageXYZ[0]=d.position.averageXYZ[1]=d.position.averageXYZ[2]=0.0;
+    for(auto& sol:acceptedSols){ d.position.averageXYZ[0]+=sol[0]; d.position.averageXYZ[1]+=sol[1]; d.position.averageXYZ[2]+=sol[2]; }
+    d.position.averageXYZ[0]/=acceptedSols.size(); d.position.averageXYZ[1]/=acceptedSols.size(); d.position.averageXYZ[2]/=acceptedSols.size();
   }
-  buildTeqcTimeplotWithNav(rf, navs, opt, d);
+  buildTeqcTimeplotWithNav(rf, navs, posOpt, d);
+  // Replace the eligibility-only position row with the quality-gated result.
+  if(!epochStatus.empty() && !rf.data.observationRecords.empty()){
+    int width=std::max(10,opt.width); if(width>120) width=120;
+    auto first=rf.data.observationRecords.front().time, last=first;
+    for(const auto& r:rf.data.observationRecords){ if(r.time<first) first=r.time; if(r.time>last) last=r.time; }
+    double span=std::max(1.0,std::chrono::duration<double>(last-first).count());
+    std::string gated(width,'s');
+    for(const auto& kv:byEpoch){
+      if(kv.second.empty()) continue;
+      int b=(int)std::floor(std::chrono::duration<double>(kv.second.front().time-first).count()/span*(width-1)+1e-9);
+      if(b<0)b=0; if(b>=width)b=width-1;
+      auto sit=epochStatus.find(kv.first);
+      if(sit==epochStatus.end()) continue;
+      if(sit->second=="OK") gated[b]='P';
+      else if(sit->second=="INSUFFICIENT_SVS") gated[b]='s';
+      else gated[b]='x';
+    }
+    for(int i=0;i<width && i<(int)d.positionTimeplot.size();++i){ if(d.positionTimeplot[i]=='g') gated[i]='g'; }
+    d.positionTimeplot=gated;
+  }
   for(auto& ev : d.riseSetEvents){ auto it=d.satelliteMaxElevationDeg.find(ev.satellite); if(it!=d.satelliteMaxElevationDeg.end()){ ev.maxElevationDeg=it->second; ev.hasEphemeris=true; } }
 }
 
@@ -927,13 +1226,8 @@ ResidualStats residual(const RinexFile& rf,const std::vector<NavigationRecord>& 
     if(!pr){ st.skippedNoPseudorange++; st.skippedNoPseudorangeBySystem[rec.system]++; continue; }
     auto eph=nearestEph(navs,rec.satellite,rec.time,opt);
     if(!eph){ st.skippedNoEphemeris++; st.skippedNoEphemerisBySystem[rec.system]++; continue; }
-    double tau=*pr/C; SatState ss;
-    for(int i=0;i<3;++i){
-      ss=prop(*eph, rec.time-std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(tau)));
-      if(!ss.ok) break;
-      auto rot=sagnac(ss.xyz,tau);
-      tau=norm3(rot,*rx)/C;
-    }
+    double tau=0.0;
+    SatState ss = propagateForPseudorange(*eph, rec.time, *pr, *rx, tau);
     if(!ss.ok){ st.skippedNoEphemeris++; st.skippedNoEphemerisBySystem[rec.system]++; continue; }
     auto rot=sagnac(ss.xyz,tau);
     double rho=norm3(rot,*rx);
@@ -959,21 +1253,39 @@ ResidualStats residual(const RinexFile& rf,const std::vector<NavigationRecord>& 
   std::map<std::string,double> epochMed;
   for(auto& kv:byEpoch) epochMed[kv.first]=median(kv.second);
   std::map<std::string,std::vector<double>> bySat;
-  for(auto& r:rows){ r.epochCentered=r.raw-epochMed[r.epoch]; bySat[r.sat].push_back(r.epochCentered); }
+  std::vector<double> epochCenteredValues;
+  std::map<std::string,std::vector<double>> epochCenteredBySystem;
+  for(auto& r:rows){
+    r.epochCentered=r.raw-epochMed[r.epoch];
+    bySat[r.sat].push_back(r.epochCentered);
+    epochCenteredValues.push_back(r.epochCentered);
+    epochCenteredBySystem[r.sys].push_back(r.epochCentered);
+  }
+  auto estat=stat(epochCenteredValues);
+  st.meanMeters=estat.mean;
+  st.rmsMeters=estat.rms;
+  st.maxAbsMeters=std::max(std::fabs(estat.min),std::fabs(estat.max));
+  for(auto& kv:epochCenteredBySystem) st.biasRemovedBySystem[kv.first]=stat(kv.second);
+
+  // Diagnostic-only satellite-bias removal.  Do not use these values as the
+  // primary QC residual because they can hide wrong constellation models.
   std::map<std::string,double> satMed;
   for(auto& kv:bySat) if(kv.second.size()>=4) satMed[kv.first]=median(kv.second);
-  std::vector<double> centered;
-  std::map<std::string,std::vector<double>> bySystem;
+  std::vector<double> satBiasRemoved;
+  std::map<std::string,std::vector<double>> satBiasRemovedBySystem;
   for(auto& r:rows){
     double v=r.epochCentered;
     if(satMed.count(r.sat)) v-=satMed[r.sat];
     r.biasRemoved=v;
-    centered.push_back(v); bySystem[r.sys].push_back(v);
+    satBiasRemoved.push_back(v);
+    satBiasRemovedBySystem[r.sys].push_back(v);
   }
-  if(!satMed.empty()) st.warnings.push_back("residual-calibration: satellite-specific code/orbit bias removed for "+std::to_string(satMed.size())+" satellites");
-  auto bstat=stat(centered);
-  st.meanMeters=bstat.mean; st.rmsMeters=bstat.rms; st.maxAbsMeters=std::max(std::fabs(bstat.min),std::fabs(bstat.max));
-  for(auto& kv:bySystem) st.biasRemovedBySystem[kv.first]=stat(kv.second);
+  if(!satMed.empty()) st.warnings.push_back("diagnostic-only: satellite-specific residual bias estimated for "+std::to_string(satMed.size())+" satellites; not used for primary QC");
+  auto sb=stat(satBiasRemoved);
+  st.satBiasRemovedMeanMeters=sb.mean;
+  st.satBiasRemovedRmsMeters=sb.rms;
+  st.satBiasRemovedMaxAbsMeters=std::max(std::fabs(sb.min),std::fabs(sb.max));
+  for(auto& kv:satBiasRemovedBySystem) st.satBiasRemovedBySystem[kv.first]=stat(kv.second);
   return st;
 }
 } // namespace

@@ -295,6 +295,49 @@ int main(){
   }
   assert(hasNeutralSource && !hasTranslatorSource);
 
+  // Inventory-only UBX SFRBX placeholder NAV records should still round-trip
+  // into NAV output so mixed-system NAV files keep their observed satellites,
+  // but QC must not treat those zero-filled placeholders as usable ephemerides.
+  ceqc::model::RinexFile invNav; invNav.header.kind = ceqc::model::RinexKind::Nav; invNav.header.version = 4.02;
+  ceqc::model::NavigationRecord inv;
+  inv.system="E"; inv.satellite="E11"; inv.recordType="EPH"; inv.messageType="INAV"; inv.messageSubtype="0"; inv.epoch=ceqc::model::makeUTC(2026,1,24,4,0,0);
+  inv.values = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2420,0,0,0,0,0,345600};
+  inv.fields["SqrtA"]={"SqrtA","sqrt(m)",0.0,10};
+  inv.fields["OrbitUsable"]={"OrbitUsable","",0.0,inv.values.size()};
+  invNav.data.navigationRecords.push_back(inv);
+  auto invMerged = ceqc::service::rinex::merge({invNav}, ceqc::model::RinexKind::Nav, 4.02);
+  bool hasInventoryNav=false;
+  for (const auto& l : invMerged.body) if (l.find("> EPH E11 INAV 0") != std::string::npos) hasInventoryNav=true;
+  assert(hasInventoryNav);
+
+  ceqc::model::QCOptions qplaceholder;
+  qplaceholder.everyEpochPosition = true;
+  auto qplaceholderSum = ceqc::service::qc::analyzeWithNavigation(rf, invNav.data.navigationRecords, qplaceholder);
+  assert(qplaceholderSum.residuals);
+  assert(qplaceholderSum.residuals->evaluated == 0);
+  assert(qplaceholderSum.residuals->skippedNoEphemeris == qplaceholderSum.observationRecords);
+
+  // UBX-derived GPS/QZSS navigation should remain usable for position QC even
+  // when mixed-system NAV files also carry inventory-only placeholder records
+  // for other constellations. This compact sample mirrors the user's failure
+  // mode where GPS/QZSS residuals were valid but every epoch returned
+  // NO_SOLUTION.
+  auto ubxObs = ceqc::service::rinex::readFile("testdata/ubx_gj_minimal.26o");
+  auto ubxNav = ceqc::service::rinex::readFile("testdata/ubx_gj_minimal.26p");
+  ceqc::model::QCOptions qubx;
+  qubx.everyEpochPosition = true;
+  qubx.ceqcExtension = true;
+  qubx.width = 20;
+  auto ubxSum = ceqc::service::qc::analyzeWithNavigation(ubxObs, ubxNav.data.navigationRecords, qubx);
+  assert(ubxSum.derived);
+  assert(ubxSum.residuals);
+  assert(ubxSum.residuals->evaluated >= 9);
+  assert(ubxSum.derived->position.epochSolutions == 1);
+  assert(!ubxSum.derived->navTimeplot.empty());
+  assert(ubxSum.derived->navTimeplot.find('+') != std::string::npos);
+  assert(!ubxSum.epochPositions.empty());
+  assert(ubxSum.epochPositions.front().status == "OK");
+
 
   // RINEX2 OBS/NAV body lines must be padded to at least 80 columns.
   // Anubis 3.11 indexes RINEX2 records by fixed columns and aborts on 79-char
@@ -322,4 +365,3 @@ int main(){
 
   std::cout << "ceqc tests passed\n";
 }
-
