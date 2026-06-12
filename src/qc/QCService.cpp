@@ -504,7 +504,13 @@ struct SystemScreenResult {
 SystemScreenResult screenPositionSystems(const RinexFile& rf, const std::vector<NavigationRecord>& navs, const std::array<double,3>& rx, const QCOptions& opt){
   SystemScreenResult out;
   IonoModel iono=ionoModelFromNavs(navs);
-  std::map<std::string,std::vector<double>> residuals;
+  // Raw UBX pseudoranges can carry a large, time-varying receiver clock common
+  // mode.  A single median over the whole session is therefore not a valid
+  // system-quality screen: it falsely rejects otherwise healthy GPS/QZSS data
+  // when the receiver clock drifts by kilometres.  Screen each constellation on
+  // epoch-centred residuals instead; this keeps satellite/orbit/code scatter and
+  // removes only the common receiver-clock term that SPP will estimate anyway.
+  std::map<std::string,std::map<std::string,std::vector<double>>> bySysEpoch;
   for(const auto& rec:rf.data.observationRecords){
     if(systemDisabledForPosition(opt, rec.system)) continue;
     auto pr=firstPseudorange(rec); if(!pr) continue;
@@ -515,24 +521,33 @@ SystemScreenResult screenPositionSystems(const RinexFile& rf, const std::vector<
     double rho=norm3(sx,rx); if(!std::isfinite(rho) || rho<=1.0) continue;
     double el=elevationRad(rx,sx);
     double res=*pr - (rho + tropoDelayMeters(rx,el) + ionoDelayMeters(rx,sx,rec.time,rec.system,iono) - C*ss.clk);
-    if(std::isfinite(res)) residuals[rec.system].push_back(res);
+    if(std::isfinite(res)) bySysEpoch[rec.system][formatUTC(rec.time)].push_back(res);
   }
-  for(auto& kv:residuals){
-    out.countBySystem[kv.first]=static_cast<int>(kv.second.size());
-    if(kv.second.size()<20) continue;
-    double med=median(kv.second);
-    std::vector<double> centered; centered.reserve(kv.second.size());
-    for(double v:kv.second) centered.push_back(v-med);
+  for(auto& skv:bySysEpoch){
+    std::vector<double> centered;
+    int rawCount=0;
+    for(auto& ekv:skv.second){
+      rawCount += static_cast<int>(ekv.second.size());
+      if(ekv.second.empty()) continue;
+      // Need at least two satellites to remove a common-mode clock without
+      // destroying all information.  With one satellite, keep it out of the
+      // screen instead of making it look perfect.
+      if(ekv.second.size()<2) continue;
+      double med=median(ekv.second);
+      for(double v:ekv.second) centered.push_back(v-med);
+    }
+    out.countBySystem[skv.first]=rawCount;
+    if(centered.size()<20) continue;
     auto st=stat(centered);
     double maxAbs=std::max(std::fabs(st.min), std::fabs(st.max));
-    out.centeredRmsBySystem[kv.first]=st.rms;
+    out.centeredRmsBySystem[skv.first]=st.rms;
     // GPS/QZSS are retained unless they are wildly broken.  Other systems are
     // admitted to the SPP only after their broadcast propagation/code model has
     // metre-to-tens-of-metres scatter.  This prevents kilometre-level BDS/GLO
     // model errors from being hidden inside receiver clock or ISB estimates.
-    double rmsGate = (kv.first=="G" || kv.first=="J") ? 150.0 : 80.0;
-    double maxGate = (kv.first=="G" || kv.first=="J") ? 800.0 : 500.0;
-    if(st.rms > rmsGate || maxAbs > maxGate) out.excludeFromPosition[kv.first]=true;
+    double rmsGate = (skv.first=="G" || skv.first=="J") ? 150.0 : 80.0;
+    double maxGate = (skv.first=="G" || skv.first=="J") ? 800.0 : 500.0;
+    if(st.rms > rmsGate || maxAbs > maxGate) out.excludeFromPosition[skv.first]=true;
   }
   return out;
 }
@@ -945,7 +960,7 @@ void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRec
       w << "position-system-screen: " << kv.first << " excluded from SPP";
       auto rit=sysScreen.centeredRmsBySystem.find(kv.first);
       auto cit=sysScreen.countBySystem.find(kv.first);
-      if(rit!=sysScreen.centeredRmsBySystem.end()) w << " centered_rms=" << std::fixed << std::setprecision(2) << rit->second << " m";
+      if(rit!=sysScreen.centeredRmsBySystem.end()) w << " epoch_centered_rms=" << std::fixed << std::setprecision(2) << rit->second << " m";
       if(cit!=sysScreen.countBySystem.end()) w << " samples=" << cit->second;
       d.position.warnings.push_back(w.str());
     }
@@ -1321,23 +1336,74 @@ QCSummary analyze(const RinexFile& rf,const QCOptions& opt){ QCSummary s; s.sour
     if(opt.ion){ auto st=stat(ionVals); st.jumps=d.ionStats["all"].jumps; d.ionStats["all"]=st; d.histogramSamples["ion"]=(int)ionVals.size(); if(!ionVals.empty()) d.histograms["ion"]=histogramLinear(ionVals,opt.ionBins); } if(opt.iod){ auto st=stat({}); st.jumps=d.iodStats["all"].jumps; d.iodStats["all"]=st; } if(opt.snr){ d.histogramSamples["snr"]=(int)sn.size(); if(!sn.empty()) d.histograms["snr"]=histogramLinear(sn,opt.snBins,0.0,60.0); } if(opt.multipath){ d.histogramSamples["mp"]=(int)mpVals.size(); if(!mpVals.empty()) d.histograms["mp"]=histogramLinear(mpVals,opt.mpBins); } if(opt.pseudorangePhase){ d.histogramSamples["pseudorange_phase"]=(int)prph.size(); if(!prph.empty()) d.histograms["pseudorange_phase"]=histogramLinear(prph,opt.bins); } if(opt.pseudorangePhase && !prph.empty()){ auto pst=stat(prph); double sd=sampleStdDev(pst); if(sd>0 && std::fabs(pst.mean)>opt.codeSigmas*sd){ std::ostringstream w; w<<"code-sigma: mean exceeds "<<opt.codeSigmas<<" sigma gate"; d.thresholdWarnings.push_back(w.str()); } } d.deletedObservations=(d.codeBandCount<2?static_cast<int>(rf.data.observationRecords.size()):0); buildTeqcTimeplot(rf,opt,d); if(opt.symbolCodes||opt.allSymbols) d.symbolLegend={"c code/phase observation epoch","L loss-of-lock","g gap","N observed without navigation","2 incomplete dual-frequency","~ observed above mask","+ expected above mask","_ below mask","- below horizon"}; d.position.candidateEpochs=s.epochCount; d.position.skippedNoNavigation=(opt.averagePosition||opt.everyEpochPosition); d.position.attempted=false; d.position.epochSolutions=0; s.derived=d; } else if(rf.header.kind==RinexKind::Nav){ s.navigationRecords=(int)rf.data.navigationRecords.size(); for(auto& r:rf.data.navigationRecords){ s.navigationValues+=(int)r.values.size(); s.navigationFields+=(int)r.fields.size(); if(!r.satellite.empty())s.satelliteAppearance[r.satellite]++; if(r.epoch){ if(!s.firstEpoch||*r.epoch<*s.firstEpoch)s.firstEpoch=r.epoch; if(!s.lastEpoch||*r.epoch>*s.lastEpoch)s.lastEpoch=r.epoch; } } s.broadcastEphemerides=s.navigationRecords; } else if(rf.header.kind==RinexKind::Met){ s.meteorologicalRecords=(int)rf.data.meteorologicalRecords.size(); for(auto& r:rf.data.meteorologicalRecords) s.meteorologicalValues+=(int)r.values.size(); } return s; }
 QCSummary analyzeWithNavigation(const RinexFile& rf,const std::vector<NavigationRecord>& navs,const QCOptions& opt){ auto s=analyze(rf,opt); if(rf.header.kind==RinexKind::Obs&&!navs.empty()){ s.residuals=residual(rf,navs,opt); applyNavBasedQCMetrics(rf, navs, opt, s); } return s; }
 std::string makePlot(const QCSummary& summary){
+  auto axis = [](size_t width){
+    if (width == 72) return std::string("-----------|-----------|-----------|-----------|-----------|-----------|");
+    std::string r(width, '-');
+    for (size_t i = 11; i < width; i += 12) r[i] = '|';
+    return r;
+  };
+  auto label = [](const std::string& sat){
+    if (sat.empty()) return std::string();
+    int p = prnNumber(sat);
+    if (sat[0] == 'G') { std::ostringstream os; os << std::setw(3) << p; return os.str(); }
+    if (sat[0] == 'R') { std::ostringstream os; os << 'R' << std::setw(2) << p; return os.str(); }
+    return sat;
+  };
+  auto firstNonSpaceLocal = [](const std::string& row){ for(size_t i=0;i<row.size();++i) if(row[i]!=' ') return (int)i; return 9999; };
+  auto lastNonSpaceLocal = [](const std::string& row){ for(int i=(int)row.size()-1;i>=0;--i) if(row[(size_t)i]!=' ') return i; return -1; };
+  auto complexity = [](const std::string& row){ int c=0; for(char ch: row) if(ch!=' ' && ch!='~') ++c; return c; };
+
   std::ostringstream os;
-  os << "COMPACT3 CEQC 0.0.1\n";
-  os << "file " << summary.sourcePath << "\n";
-  os << "epochs " << summary.epochCount << " obs_records " << summary.observationRecords << "\n";
-  if(summary.firstEpoch) os << "first " << formatUTC(*summary.firstEpoch) << "\n";
-  if(summary.lastEpoch) os << "last " << formatUTC(*summary.lastEpoch) << "\n";
+  size_t width = 72;
+  std::string obsLine(width, ' ');
+  if(summary.derived && !summary.derived->obsTimeplot.empty()) { width = summary.derived->obsTimeplot.size(); obsLine = summary.derived->obsTimeplot; }
+  std::string ax = axis(width);
+  os << " SV+" << ax << "+ SV\n";
   if(summary.derived){
-    os << " SV+" << std::string(summary.derived->obsTimeplot.size(), '-') << "+ SV\n";
     std::vector<std::pair<std::string,std::string>> rows(summary.derived->satelliteTimeplot.begin(), summary.derived->satelliteTimeplot.end());
-    std::sort(rows.begin(), rows.end(), [](const auto& a,const auto& b){ if(a.first.empty()||b.first.empty()) return a.first<b.first; if(a.first[0]!=b.first[0]) return a.first<b.first; return prnNumber(a.first)<prnNumber(b.first); });
-    for(auto& r:rows) os << std::setw(3) << r.first.substr(1) << "|" << r.second << "| " << std::setw(3) << r.first.substr(1) << "\n";
-    os << "Obs|" << summary.derived->obsTimeplot << "|Obs\n";
+    std::sort(rows.begin(), rows.end(), [&](const auto& a,const auto& b){
+      if(a.first.empty()||b.first.empty()) return a.first<b.first;
+      char sa=a.first[0], sb=b.first[0];
+      if(sa!=sb) return sa<sb;
+      auto key=[&](const auto& r){
+        const std::string& row=r.second;
+        bool unhealthy=row.find("'")!=std::string::npos;
+        int first=firstNonSpaceLocal(row), last=lastNonSpaceLocal(row);
+        int complex=complexity(row);
+        int prn=prnNumber(r.first);
+        int sysWeight = r.first.empty()?9:(r.first[0]=='G'?0:(r.first[0]=='R'?1:2));
+        int group=5;
+        if(unhealthy) group=0; else if(first>0) group=3; else if(!row.empty() && row[0]=='2') group=1; else if(complex<=2) group=2; else group=4;
+        double mxEl = summary.derived->satelliteMaxElevationDeg.count(r.first) ? summary.derived->satelliteMaxElevationDeg.at(r.first) : -999.0;
+        int elevKey = static_cast<int>(std::lround(-mxEl*10.0));
+        return std::tuple<int,int,int,int,int,int,int>(sysWeight, group, unhealthy?last:first, elevKey, complex, last, prn);
+      };
+      return key(a)<key(b);
+    });
+    for(auto& r: rows){
+      std::string lab=label(r.first);
+      os << std::setw(3) << lab << '|' << r.second << '|' << std::setw(3) << lab << "\n";
+    }
   }
-  for(auto& kv:summary.systemAppearance) os << "system " << kv.first << " " << kv.second << "\n";
-  os << "symbol c observation epoch\n";
-  os << "symbol L loss-of-lock\n";
-  os << "symbol g gap\n";
+  bool navAssisted = (summary.derived && summary.derived->position.epochSolutions > 0) || !summary.navInputFiles.empty();
+  if(navAssisted){
+    os << "-dn|" << std::string(width, ' ') << "|-dn\n";
+    os << "+dn|" << obsLine << "|+dn\n";
+    std::string plus10 = obsLine;
+    for(char& c: plus10){ if(c>='0' && c<='8') c='9'; else if(c=='9') c='a'; }
+    os << "+10|" << plus10 << "|+10\n";
+    std::string pos = (summary.derived && !summary.derived->positionTimeplot.empty()) ? summary.derived->positionTimeplot : std::string(width,' ');
+    for(char& c: pos) if(c=='P') c='o';
+    os << "Pos|" << pos << "|Pos\n";
+  } else {
+    os << "Obs|" << obsLine << "|Obs\n";
+  }
+  os << "Clk|" << std::string(width, ' ') << "|Clk\n";
+  os << "   +" << ax << "+   \n";
+  if(summary.firstEpoch && summary.lastEpoch){
+    os << "first: " << formatUTC(*summary.firstEpoch) << "\n";
+    os << "last : " << formatUTC(*summary.lastEpoch) << "\n";
+  }
+  os << "symbols: c code/phase, L loss-of-lock, N no-nav, 2 incomplete dual-frequency, ~ observed above mask, + expected, _ below mask, - below horizon\n";
   return os.str();
-}
-}
+}}

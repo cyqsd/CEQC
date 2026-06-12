@@ -384,6 +384,7 @@ int Application::run(const std::vector<std::string>& args) {
     }
 
     std::string renderedQC;
+    std::vector<QCSummary> qcSummariesForAux;
     if (op.qc) {
       std::vector<NavigationRecord> navs;
       std::vector<std::string> navPaths;
@@ -401,6 +402,7 @@ int Application::run(const std::vector<std::string>& args) {
         auto s = navs.empty() ? service::qc::analyze(rf, op.qcOptions) : service::qc::analyzeWithNavigation(rf, navs, op.qcOptions);
         s.navInputFiles = navPaths;
         s.navigationSatelliteAppearance = navSatAppear;
+        if (rf.header.kind == RinexKind::Obs) qcSummariesForAux.push_back(s);
         view::printQC(qout, s, op.quietQC, op.teqcCompat || !op.quietQC);
       }
       renderedQC = normalizeEOL(qout.str(), op.teqcEOL);
@@ -464,11 +466,7 @@ int Application::run(const std::vector<std::string>& args) {
     if (!op.outputBinex.empty()) { writeBinex00Metadata(op.outputBinex, op, files); }
 
     if (op.qcOptions.plot || op.qcOptions.slipsEnabled) {
-      std::vector<NavigationRecord> navs;
-      for (auto& rf : files) if (rf.header.kind == RinexKind::Nav) navs.insert(navs.end(), rf.data.navigationRecords.begin(), rf.data.navigationRecords.end());
-      for (auto& rf : files) {
-        if (rf.header.kind != RinexKind::Obs) continue;
-        auto s = navs.empty() ? service::qc::analyze(rf, op.qcOptions) : service::qc::analyzeWithNavigation(rf, navs, op.qcOptions);
+      auto emitAux = [&](const QCSummary& s) {
         if (op.qcOptions.plot) {
           std::string root = op.qcOptions.root.empty() ? "ceqc" : op.qcOptions.root;
           std::ofstream f(root + ".plot");
@@ -479,6 +477,17 @@ int Application::run(const std::vector<std::string>& args) {
           if (s.derived) {
             for (auto& ev : s.derived->slipEvents) slips << ev.time << " " << ev.satellite << " " << ev.type << " " << ev.detail << "\n";
           }
+        }
+      };
+      if (!qcSummariesForAux.empty()) {
+        for (const auto& s : qcSummariesForAux) emitAux(s);
+      } else {
+        std::vector<NavigationRecord> navs;
+        for (auto& rf : files) if (rf.header.kind == RinexKind::Nav) navs.insert(navs.end(), rf.data.navigationRecords.begin(), rf.data.navigationRecords.end());
+        for (auto& rf : files) {
+          if (rf.header.kind != RinexKind::Obs) continue;
+          auto s = navs.empty() ? service::qc::analyze(rf, op.qcOptions) : service::qc::analyzeWithNavigation(rf, navs, op.qcOptions);
+          emitAux(s);
         }
       }
     }

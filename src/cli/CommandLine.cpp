@@ -230,6 +230,13 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
   auto args = expandConfigArgs(rawArgs, configFiles);
   Operation op;
   op.configFiles = configFiles;
+  bool qcRequested = false;
+  bool translationRequested = false;
+  for (size_t k = 0; k < args.size(); ++k) {
+    const auto& x = args[k];
+    if (x == "+qc" || x == "+qcq" || x == "+plot" || x == "+slips" || x == "++slips") qcRequested = true;
+    if (x == "-tr") translationRequested = true;
+  }
   for (size_t i = 0; i < args.size(); ++i) {
     auto a = args[i];
     if (a == "+help" || a == "-help" || a == "--help" || a == "-h") op.showHelp = true;
@@ -250,7 +257,20 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if (a == "-teqc_diff" && nextIsValue(args, i)) op.teqcDiff = args[++i];
     else if (a == "-teqc_eol" && nextIsValue(args, i)) op.teqcEOL = lower(args[++i]);
     else if (a == "+obs" && nextIsValue(args, i)) op.outputObs = args[++i];
-    else if (a == "+nav" && nextIsValue(args, i)) op.outputNav = args[++i];
+    else if (a == "+nav" && nextIsValue(args, i)) {
+      std::string v = args[++i];
+      // teqc compatibility: in QC/plot mode, +nav names the auxiliary NAV file(s).
+      // In translation/export mode, keep CEQC/RTKLIB meaning: +nav is the output
+      // NAV path.  This lets both of these work without ambiguity:
+      //   ceqc -tr ubx +obs out.o +nav out.p raw.ubx
+      //   ceqc +qc +plot +nav brdc.nav obs.o
+      if (qcRequested && !translationRequested) {
+        auto vals = split(v);
+        op.qcOptions.navFiles.insert(op.qcOptions.navFiles.end(), vals.begin(), vals.end());
+      } else {
+        op.outputNav = v;
+      }
+    }
     else if (a == "+met" && nextIsValue(args, i)) op.outputMet = args[++i];
     else if (a == "+binex" && nextIsValue(args, i)) op.outputBinex = args[++i];
     else if (a == "-tr" && nextIsValue(args, i)) op.translatorName = args[++i];
@@ -310,8 +330,8 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if (a == "-mp") op.qcOptions.multipath = false;
     else if (a == "+mp_raw") op.qcOptions.mpRaw = true;
     else if (a == "-mp_raw") op.qcOptions.mpRaw = false;
-    else if (a == "+sn") op.qcOptions.snr = true;
-    else if (a == "-sn") op.qcOptions.snr = false;
+    else if (a == "+sn" || a == "+snr") op.qcOptions.snr = true;
+    else if (a == "-sn" || a == "-snr") op.qcOptions.snr = false;
     else if (a == "+lli") op.qcOptions.lli = true;
     else if (a == "-lli") op.qcOptions.lli = false;
     else if (a == "+pl") op.qcOptions.pseudorangePhase = true;

@@ -135,6 +135,7 @@ Quality check modes:
 	+qcq                       compact CEQC diagnostic summary
 	-qc / -qcq                 disable quality-check output
 	-nav file1[,file2...]      use auxiliary RINEX NAV files for QC/residuals
+	+nav file1[,file2...]      teqc-compatible QC alias for -nav when +qc/+qcq is used
 	-no_orbit <systems>        do not use listed systems for orbit residual QC
 	-no_pos <systems>          do not use listed systems for point-position QC
 	+ap / -ap                  average position report on/off
@@ -147,7 +148,7 @@ Quality check modes:
 	+mp / -mp                  multipath combination diagnostics on/off
 	+mp_raw                    report raw multipath series where supported
 	+pl / -pl                  pseudorange-minus-phase diagnostics on/off
-	+sn / -sn                  signal-to-noise diagnostics on/off
+	+sn/+snr / -sn/-snr        signal-to-noise diagnostics on/off
 	+slips name                write slip/event candidates to file name
 	++slips name               append slip/event candidates to file name
 	-slips                     disable slip/event file output

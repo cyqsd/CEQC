@@ -733,7 +733,15 @@ void maybeFillApproxFromNav(RinexFile& out, const std::vector<RinexFile>& files)
   if (out.header.kind != RinexKind::Obs) return;
   if (!isZeroApproxHeader(out)) return;
   std::vector<NavigationRecord> navs;
-  for (auto& f : files) if (f.header.kind == RinexKind::Nav) navs.insert(navs.end(), f.data.navigationRecords.begin(), f.data.navigationRecords.end());
+  for (auto& f : files) {
+    if (f.header.kind != RinexKind::Nav) continue;
+    for (const auto& n : f.data.navigationRecords) {
+      // Header bootstrap must be conservative and fast.  Newly assembled C/E
+      // SFRBX ephemerides are validated later by QC residual gates; do not let
+      // them make RINEX conversion spend minutes trying to estimate APPROX XYZ.
+      if (n.system == "G" || n.system == "J") navs.push_back(n);
+    }
+  }
   if (navs.empty()) return;
   if (auto xyz = ceqc::service::qc::estimateApproxPosition(out, navs)) {
     std::ostringstream v;

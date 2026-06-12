@@ -87,10 +87,13 @@ int gpsLikeSubframeId(const std::vector<uint32_t>& w){
   for(int c:candidates) if(c>=1 && c<=5) return c;
   return 0;
 }
-std::string sfrbxMessageType(int gnss,int sig){
+std::string sfrbxMessageType(int gnss,int sv,int sig){
   std::string sy=sys(gnss);
-  if(sy=="E") return sig==1?"FNAV":"INAV";
-  if(sy=="C") return sig==0?"D1":"D2";
+  if(sy=="E") return sig==1?"INAV":"INAV";
+  // u-blox RXM-SFRBX BeiDou should be interpreted by constellation PRN, not
+  // by sigId alone.  RTKLIB uses D1 for BDS IGSO/MEO (PRN > 5) and D2 for GEO
+  // (PRN <= 5).  Treating sigId=1 as D2 suppresses all usable C06+ ephemerides.
+  if(sy=="C") return sv>5?"D1":"D2";
   if(sy=="R") return "FDMA";
   return "LNAV";
 }
@@ -113,6 +116,23 @@ std::vector<int> bitsFromWords(const std::vector<uint32_t>& words, int width) {
     for (int i=width-1;i>=0;--i) b.push_back(static_cast<int>((v >> i) & 1u));
   }
   return b;
+}
+std::vector<int> bitsFromBytes(const std::vector<unsigned char>& bytes) {
+  std::vector<int> b;
+  b.reserve(bytes.size() * 8);
+  for (unsigned char by : bytes) {
+    for (int i=7;i>=0;--i) b.push_back(static_cast<int>((by >> i) & 1u));
+  }
+  return b;
+}
+uint64_t getBitUBytes(const std::vector<unsigned char>& bytes, int pos, int len) {
+  if (pos < 0 || len < 0 || pos + len > static_cast<int>(bytes.size() * 8) || len > 63) return 0;
+  uint64_t v = 0;
+  for (int i=0;i<len;++i) {
+    int bit = pos + i;
+    v = (v << 1) | static_cast<uint64_t>((bytes[static_cast<size_t>(bit/8)] >> (7 - (bit % 8))) & 1u);
+  }
+  return v;
 }
 uint64_t bitU(const std::vector<int>& b, int pos, int len) {
   if (pos < 0 || len < 0 || pos + len > static_cast<int>(b.size()) || len > 63) return 0;
@@ -214,18 +234,43 @@ std::optional<DecodedSFRBX> tryDecodeGalileoAt(const std::vector<int>& b, int o)
   return d;
 }
 std::optional<DecodedSFRBX> decodeGalileoINAV(const std::vector<uint32_t>& words) {
-  std::optional<DecodedSFRBX> best;
-  for (int width : {32,30}) {
-    auto b = bitsFromWords(words,width);
-    for (int off=0; off + 128 <= static_cast<int>(b.size()); ++off) {
-      auto d = tryDecodeGalileoAt(b, off);
-      if (!d) continue;
-      d->f["GalileoWordWidth"] = width;
-      // Prefer ICD-aligned offsets but still allow u-blox word wrappers to shift by a few bits.
-      if (!best || d->kind == 1 || (best->kind != 1 && off < best->f["GalileoBitOffset"])) best = d;
-    }
+  // RXM-SFRBX Galileo I/NAV on u-blox F9/M10 class receivers is not a plain
+  // concatenation of 32-bit dwords.  The first 8 dwords contain two 128-bit
+  // I/NAV page parts; each dword has to be byte-swapped first.  This mirrors
+  // the proven RTKLIB decode_enav() packing: part/page bits live at bit 0/1 of
+  // each half, the word type starts at bit 2, and the useful data is 112 bits
+  // from the even part plus 16 bits from the odd part.
+  if (words.size() < 8) return std::nullopt;
+  std::vector<unsigned char> buff;
+  buff.reserve(32);
+  for (int i=0;i<8;++i) {
+    uint32_t w = words[static_cast<size_t>(i)];
+    buff.push_back(static_cast<unsigned char>((w >> 24) & 0xFFu));
+    buff.push_back(static_cast<unsigned char>((w >> 16) & 0xFFu));
+    buff.push_back(static_cast<unsigned char>((w >> 8) & 0xFFu));
+    buff.push_back(static_cast<unsigned char>(w & 0xFFu));
   }
-  return best;
+  int part1 = static_cast<int>(getBitUBytes(buff,0,1));
+  int page1 = static_cast<int>(getBitUBytes(buff,1,1));
+  int part2 = static_cast<int>(getBitUBytes(buff,128,1));
+  int page2 = static_cast<int>(getBitUBytes(buff,129,1));
+  if (page1 != 0 || page2 != 0 || part1 != 0 || part2 != 1) return std::nullopt;
+  int wt = static_cast<int>(getBitUBytes(buff,2,6));
+  if (wt < 1 || wt > 5) return std::nullopt;
+  std::vector<unsigned char> page;
+  page.reserve(16);
+  for (int i=0;i<14;++i) page.push_back(static_cast<unsigned char>(getBitUBytes(buff,2 + i*8,8)));
+  for (int i=0;i<2;++i) page.push_back(static_cast<unsigned char>(getBitUBytes(buff,128 + 2 + i*8,8)));
+  auto bits = bitsFromBytes(page);
+  auto d = tryDecodeGalileoAt(bits,0);
+  if (!d || d->kind != wt) return std::nullopt;
+  d->f["GalileoWordWidth"] = 128;
+  d->f["GalileoPart1"] = part1;
+  d->f["GalileoPart2"] = part2;
+  return d;
+}
+double bdsSow(const std::vector<int>& b) {
+  return static_cast<double>(joinUnsigned({{bitU(b,18,8),8},{bitU(b,30,12),12}}));
 }
 std::optional<DecodedSFRBX> decodeBDSD1(const std::vector<uint32_t>& words) {
   if (words.size() < 10) return std::nullopt;
@@ -234,7 +279,7 @@ std::optional<DecodedSFRBX> decodeBDSD1(const std::vector<uint32_t>& words) {
   int fra = static_cast<int>(bitU(b,15,3));
   if (fra < 1 || fra > 5) return std::nullopt;
   d.kind = fra; d.f["BeiDouD1Subframe"] = fra; d.f["PageID"] = fra; d.f["DecodedPageModel"] = 3100 + fra;
-  double sow = static_cast<double>((bitU(b,18,8) << 12) | bitU(b,30,12));
+  double sow = bdsSow(b);
   d.f["SOW"] = sow; d.f["TransmissionTime"] = sow;
   if (fra == 1) {
     int urai = static_cast<int>(bitU(b,48,4));
@@ -243,13 +288,13 @@ std::optional<DecodedSFRBX> decodeBDSD1(const std::vector<uint32_t>& words) {
     d.f["SVAccuracy"] = bdsUraMeters(urai);
     d.f["URAI"] = urai;
     d.f["Week"] = bitU(b,60,13);
-    d.f["Toc"] = static_cast<double>((bitU(b,73,9) << 8) | bitU(b,90,8)) * 8.0;
+    d.f["Toc"] = joinUnsigned({{bitU(b,73,9),9},{bitU(b,90,8),8}}) * 8.0;
     d.f["TGD1"] = bitS(b,98,10) * 1e-10;
-    d.f["TGD2"] = bitS(b,108,10) * 1e-10;
-    d.f["SV_clock_bias"] = joinSigned({{bitU(b,180,7),7},{bitU(b,210,17),17}}) * std::pow(2.0,-33);
-    d.f["SV_clock_drift"] = joinSigned({{bitU(b,227,5),5},{bitU(b,240,17),17}}) * std::pow(2.0,-50);
-    d.f["SV_clock_drift_rate"] = bitS(b,257,11) * std::pow(2.0,-66);
-    d.f["AODE"] = bitU(b,270,5);
+    d.f["TGD2"] = joinSigned({{bitU(b,108,4),4},{bitU(b,120,6),6}}) * 1e-10;
+    d.f["SV_clock_drift_rate"] = bitS(b,214,11) * std::pow(2.0,-66);
+    d.f["SV_clock_bias"] = joinSigned({{bitU(b,225,7),7},{bitU(b,240,17),17}}) * std::pow(2.0,-33);
+    d.f["SV_clock_drift"] = joinSigned({{bitU(b,257,5),5},{bitU(b,270,17),17}}) * std::pow(2.0,-50);
+    d.f["AODE"] = bitU(b,287,5);
   } else if (fra == 2) {
     d.f["DeltaN"] = joinSigned({{bitU(b,42,10),10},{bitU(b,60,6),6}}) * std::pow(2.0,-43) * PI_CONST;
     d.f["Cuc"] = joinSigned({{bitU(b,66,16),16},{bitU(b,90,2),2}}) * std::pow(2.0,-31);
@@ -263,12 +308,12 @@ std::optional<DecodedSFRBX> decodeBDSD1(const std::vector<uint32_t>& words) {
   } else if (fra == 3) {
     d.f["ToeLS"] = joinUnsigned({{bitU(b,42,10),10},{bitU(b,60,5),5}});
     d.f["I0"] = joinSigned({{bitU(b,65,17),17},{bitU(b,90,15),15}}) * std::pow(2.0,-31) * PI_CONST;
-    d.f["IDOT"] = joinSigned({{bitU(b,105,13),13},{bitU(b,279,1),1}}) * std::pow(2.0,-43) * PI_CONST;
-    d.f["OmegaDot"] = joinSigned({{bitU(b,120,11),11},{bitU(b,150,13),13}}) * std::pow(2.0,-43) * PI_CONST;
-    d.f["Omega"] = joinSigned({{bitU(b,163,9),9},{bitU(b,180,23),23}}) * std::pow(2.0,-31) * PI_CONST;
-    d.f["Omega0"] = joinSigned({{bitU(b,203,11),11},{bitU(b,240,21),21}}) * std::pow(2.0,-31) * PI_CONST;
-    d.f["Cic"] = joinSigned({{bitU(b,261,7),7},{bitU(b,270,11),11}}) * std::pow(2.0,-31);
-    d.f["Cis"] = joinSigned({{bitU(b,281,9),9},{bitU(b,0,0),0}}) * std::pow(2.0,-31);
+    d.f["Cic"] = joinSigned({{bitU(b,105,7),7},{bitU(b,120,11),11}}) * std::pow(2.0,-31);
+    d.f["OmegaDot"] = joinSigned({{bitU(b,131,11),11},{bitU(b,150,13),13}}) * std::pow(2.0,-43) * PI_CONST;
+    d.f["Cis"] = joinSigned({{bitU(b,163,9),9},{bitU(b,180,9),9}}) * std::pow(2.0,-31);
+    d.f["IDOT"] = joinSigned({{bitU(b,189,13),13},{bitU(b,210,1),1}}) * std::pow(2.0,-43) * PI_CONST;
+    d.f["Omega0"] = joinSigned({{bitU(b,211,21),21},{bitU(b,240,11),11}}) * std::pow(2.0,-31) * PI_CONST;
+    d.f["Omega"] = joinSigned({{bitU(b,251,11),11},{bitU(b,270,21),21}}) * std::pow(2.0,-31) * PI_CONST;
   } else {
     d.f["BeiDouD1AlmanacOrTimeSubframe"] = fra;
   }
@@ -278,31 +323,57 @@ std::optional<DecodedSFRBX> decodeBDSD2(const std::vector<uint32_t>& words) {
   if (words.size() < 10) return std::nullopt;
   auto b = bitsFromWords(words,30);
   int fra = static_cast<int>(bitU(b,15,3));
-  int page = static_cast<int>(bitU(b,11,4));
-  if (fra < 1 || fra > 5) return std::nullopt;
+  int page = static_cast<int>(bitU(b,42,4));
+  if (fra < 1 || fra > 5 || page < 1 || page > 10) return std::nullopt;
   DecodedSFRBX d; d.ok = true; d.kind = fra; d.subKind = page; d.model = "BeiDou_D2_300bit";
-  d.f["BeiDouD2Subframe"] = fra; d.f["BeiDouD2Page"] = page; d.f["PageID"] = page > 0 ? page : fra; d.f["DecodedPageModel"] = 3200 + fra * 10 + page;
-  d.f["SOW"] = static_cast<double>((bitU(b,18,8) << 12) | bitU(b,30,12));
-  if (fra == 1 && page == 1) {
-    int urai = static_cast<int>(bitU(b,48,4));
-    d.f["Week"] = bitU(b,60,13);
-    d.f["SatH1"] = bitU(b,42,1);
-    d.f["AODC"] = bitU(b,43,5);
+  d.f["BeiDouD2Subframe"] = fra; d.f["BeiDouD2Page"] = page; d.f["PageID"] = page; d.f["DecodedPageModel"] = 3200 + page;
+  d.f["SOW"] = bdsSow(b); d.f["TransmissionTime"] = d.f["SOW"];
+  if (fra != 1) return d;
+  if (page == 1) {
+    int urai = static_cast<int>(bitU(b,60,4));
+    d.f["SatH1"] = bitU(b,46,1);
+    d.f["AODC"] = bitU(b,47,5);
     d.f["URAI"] = urai;
     d.f["SVAccuracy"] = bdsUraMeters(urai);
-    d.f["Toc"] = static_cast<double>((bitU(b,73,5) << 12) | bitU(b,90,12)) * 8.0;
+    d.f["Week"] = bitU(b,64,13);
+    d.f["Toc"] = joinUnsigned({{bitU(b,77,5),5},{bitU(b,90,12),12}}) * 8.0;
     d.f["TGD1"] = bitS(b,102,10) * 1e-10;
     d.f["TGD2"] = bitS(b,120,10) * 1e-10;
-  } else if (fra == 1 && page == 4) {
-    d.f["AODE"] = bitU(b,132,5);
-    d.f["DeltaN"] = bitS(b,137,16) * std::pow(2.0,-43) * PI_CONST;
-    d.f["Cuc"] = joinSigned({{bitU(b,153,14),14},{bitU(b,180,4),4}}) * std::pow(2.0,-31);
-    d.f["SV_clock_drift"] = joinSigned({{bitU(b,184,6),6},{bitU(b,210,12),12}}) * std::pow(2.0,-50);
-    d.f["SV_clock_drift_rate"] = joinSigned({{bitU(b,120,10),10},{bitU(b,130,1),1}}) * std::pow(2.0,-66);
-  } else if (fra == 1 && page == 5) {
-    d.f["Cus"] = joinSigned({{bitU(b,137,14),14},{bitU(b,180,4),4}}) * std::pow(2.0,-31);
-    d.f["M0"] = joinSigned({{bitU(b,184,8),8},{bitU(b,210,22),22},{bitU(b,132,2),2}}) * std::pow(2.0,-31) * PI_CONST;
-    d.f["EccentricityMS"] = bitU(b,192,10);
+  } else if (page == 3) {
+    d.f["SV_clock_bias"] = joinSigned({{bitU(b,100,12),12},{bitU(b,120,12),12}}) * std::pow(2.0,-33);
+    d.f["SV_clock_drift_P3_MSB"] = bitS(b,132,4);
+  } else if (page == 4) {
+    d.f["SV_clock_drift_P4_LSB"] = joinUnsigned({{bitU(b,46,6),6},{bitU(b,60,12),12}});
+    d.f["SV_clock_drift_rate"] = joinSigned({{bitU(b,72,10),10},{bitU(b,90,1),1}}) * std::pow(2.0,-66);
+    d.f["AODE"] = bitU(b,91,5);
+    d.f["DeltaN"] = bitS(b,96,16) * std::pow(2.0,-43) * PI_CONST;
+    d.f["Cuc_P4_MSB"] = bitS(b,120,14);
+  } else if (page == 5) {
+    d.f["Cuc_P5_LSB"] = bitU(b,46,4);
+    d.f["M0"] = joinSigned({{bitU(b,50,2),2},{bitU(b,60,22),22},{bitU(b,90,8),8}}) * std::pow(2.0,-31) * PI_CONST;
+    d.f["Cus"] = joinSigned({{bitU(b,98,14),14},{bitU(b,120,4),4}}) * std::pow(2.0,-31);
+    d.f["Eccentricity_P5_MSB"] = bitU(b,124,10);
+  } else if (page == 6) {
+    d.f["Eccentricity_P6_LSB"] = joinUnsigned({{bitU(b,46,6),6},{bitU(b,60,16),16}});
+    d.f["SqrtA"] = joinUnsigned({{bitU(b,76,6),6},{bitU(b,90,22),22},{bitU(b,120,4),4}}) * std::pow(2.0,-19);
+    d.f["Cic_P6_MSB"] = bitS(b,124,10);
+  } else if (page == 7) {
+    d.f["Cic_P7_LSB"] = joinUnsigned({{bitU(b,46,6),6},{bitU(b,60,2),2}});
+    d.f["Cis"] = bitS(b,62,18) * std::pow(2.0,-31);
+    d.f["Toe"] = joinUnsigned({{bitU(b,80,2),2},{bitU(b,90,15),15}}) * 8.0;
+    d.f["I0_P7_MSB"] = joinSigned({{bitU(b,105,7),7},{bitU(b,120,14),14}});
+  } else if (page == 8) {
+    d.f["I0_P8_LSB"] = joinUnsigned({{bitU(b,46,6),6},{bitU(b,60,5),5}});
+    d.f["Crc"] = joinSigned({{bitU(b,65,17),17},{bitU(b,90,1),1}}) * std::pow(2.0,-6);
+    d.f["Crs"] = bitS(b,91,18) * std::pow(2.0,-6);
+    d.f["OmegaDot_P8_MSB"] = joinSigned({{bitU(b,109,3),3},{bitU(b,120,16),16}});
+  } else if (page == 9) {
+    d.f["OmegaDot_P9_LSB"] = bitU(b,46,5);
+    d.f["Omega0"] = joinSigned({{bitU(b,51,1),1},{bitU(b,60,22),22},{bitU(b,90,9),9}}) * std::pow(2.0,-31) * PI_CONST;
+    d.f["Omega_P9_MSB"] = joinSigned({{bitU(b,99,13),13},{bitU(b,120,14),14}});
+  } else if (page == 10) {
+    d.f["Omega_P10_LSB"] = bitU(b,46,5);
+    d.f["IDOT"] = joinSigned({{bitU(b,51,1),1},{bitU(b,60,13),13}}) * std::pow(2.0,-43) * PI_CONST;
   }
   return d;
 }
@@ -322,7 +393,7 @@ void setInternalField(NavigationRecord& out, const std::string& name, double val
 NavigationRecord makeSFRBXRecord(const std::vector<unsigned char>& pl, int cls=2, int id=0x13){
   int gnss=pl.size()>0?pl[0]:0, sv=pl.size()>1?pl[1]:0, sig=pl.size()>2?pl[2]:0, freq=pl.size()>3?pl[3]:0, nWords=pl.size()>4?pl[4]:0, chn=pl.size()>5?pl[5]:0;
   auto words=sfrbxWords(pl);
-  NavigationRecord nr; nr.system=sys(gnss); nr.satellite=sat(gnss,sv); nr.messageType=sfrbxMessageType(gnss,sig); nr.messageSubtype="SFRBX"; nr.recordType="EPH";
+  NavigationRecord nr; nr.system=sys(gnss); nr.satellite=sat(gnss,sv); nr.messageType=sfrbxMessageType(gnss,sv,sig); nr.messageSubtype="SFRBX"; nr.recordType="EPH";
   nr.rawLines.push_back("> EPH "+nr.satellite+" "+nr.messageType+" SFRBX");
   std::ostringstream line; line<<"    UBX-RXM-SFRBX gnss="<<gnss<<" sv="<<sv<<" sig="<<sig<<" freq="<<freq<<" ch="<<chn<<" words="<<nWords<<" raw="<<hexWords(pl); nr.rawLines.push_back(line.str());
   auto add=[&](const std::string& name,double value){ NavigationField f{name,"",value,nr.values.size()}; nr.values.push_back(value); nr.fields[name]=f; };
@@ -335,7 +406,6 @@ NavigationRecord makeSFRBXRecord(const std::vector<unsigned char>& pl, int cls=2
   }
   if(gnss==3 && !words.empty()){
     std::optional<DecodedSFRBX> bd = (nr.messageType == "D2") ? decodeBDSD2(words) : decodeBDSD1(words);
-    if (!bd) bd = decodeBDSD1(words);
     if (bd) addDecodedFields(nr, *bd);
     uint32_t h=2166136261u; for(auto ww:words){ h^=ww; h*=16777619u; } add("BeiDouDataHash", h);
   }
@@ -428,6 +498,37 @@ uint32_t pagesHash(const std::vector<NavigationRecord>& pages) {
   }
   return hash;
 }
+
+double fieldOr(const NavigationRecord* rec, const std::string& name, double fallback=0.0) {
+  if (!rec) return fallback;
+  auto it = rec->fields.find(name);
+  return it == rec->fields.end() ? fallback : it->second.value;
+}
+bool sowStep(double a, double b, double step) {
+  double d = b - a;
+  if (d < -302400.0) d += 604800.0;
+  if (d >  302400.0) d -= 604800.0;
+  return std::fabs(d - step) < 0.5;
+}
+bool bdsOrbitPlausible(double sqrtA, double ecc, double toe, double toc, int week, double af0, double af1, double af2) {
+  return std::isfinite(sqrtA) && sqrtA > 5000.0 && sqrtA < 7000.0 &&
+         std::isfinite(ecc) && ecc >= 0.0 && ecc < 0.2 &&
+         std::isfinite(toe) && toe >= 0.0 && toe < 604800.0 &&
+         std::isfinite(toc) && toc >= 0.0 && toc < 604800.0 &&
+         week > 0 && week < 8192 &&
+         std::isfinite(af0) && std::fabs(af0) < 0.02 &&
+         std::isfinite(af1) && std::fabs(af1) < 1e-8 &&
+         std::isfinite(af2) && std::fabs(af2) < 1e-16;
+}
+std::string bdsAssemblyKey(const NavigationRecord& ar) {
+  int aode = 0;
+  if (auto it = ar.fields.find("AODE"); it != ar.fields.end()) aode = static_cast<int>(std::llround(it->second.value));
+  double toe = 0.0;
+  if (auto it = ar.fields.find("Toe"); it != ar.fields.end()) toe = it->second.value;
+  std::ostringstream os;
+  os << ar.satellite << ":" << ar.messageType << ":" << aode << ":" << std::fixed << std::setprecision(0) << toe;
+  return os.str();
+}
 void decodeGPSLNAVFromSubframes(NavigationRecord& out, const std::map<int,NavigationRecord>& subframes){
   if(!subframes.count(1)||!subframes.count(2)||!subframes.count(3)) return;
   auto wordsOf=[&](int sf){ std::vector<uint64_t> w; for(int i=1;i<=10;++i) w.push_back(word30(subframes.at(sf),i)); return w; };
@@ -496,22 +597,29 @@ NavigationRecord makeAssembledLNAV(const std::string& key,const std::map<int,Nav
 
 
 std::optional<NavigationRecord> makeAssembledGalileo(const std::string& key,const std::vector<NavigationRecord>& pages,const std::optional<TimePoint>& refEpoch){
-  std::map<int,const NavigationRecord*> byType;
+  std::map<int,std::map<int,const NavigationRecord*>> byIodType;
+  const NavigationRecord* word5 = nullptr;
   for (const auto& p : pages) {
     auto it = p.fields.find("GalileoWordType");
     if (it == p.fields.end()) continue;
     int wt = static_cast<int>(std::llround(it->second.value));
-    if (wt >= 1 && wt <= 5 && !byType.count(wt)) byType[wt] = &p;
+    if (wt == 5) word5 = &p;
+    if (wt < 1 || wt > 4) continue;
+    auto ii = p.fields.find("GalileoIODnav");
+    if (ii == p.fields.end()) continue;
+    int iodv = static_cast<int>(std::llround(ii->second.value));
+    byIodType[iodv][wt] = &p;
   }
-  for (int wt=1; wt<=5; ++wt) if (!byType.count(wt)) return std::nullopt;
+  if (!word5) return std::nullopt;
   int iod = -1;
-  for (int wt=1; wt<=4; ++wt) {
-    auto it = byType[wt]->fields.find("GalileoIODnav");
-    if (it == byType[wt]->fields.end()) return std::nullopt;
-    int v = static_cast<int>(std::llround(it->second.value));
-    if (iod < 0) iod = v;
-    else if (iod != v) return std::nullopt;
+  std::map<int,const NavigationRecord*> byType;
+  for (auto it = byIodType.rbegin(); it != byIodType.rend(); ++it) {
+    bool complete = true;
+    for (int wt=1; wt<=4; ++wt) if (!it->second.count(wt)) complete = false;
+    if (complete) { iod = it->first; byType = it->second; break; }
   }
+  if (iod < 0) return std::nullopt;
+  byType[5] = word5;
   auto get=[&](int wt,const std::string& name)->std::optional<double>{
     auto it = byType[wt]->fields.find(name);
     if (it == byType[wt]->fields.end() || !std::isfinite(it->second.value)) return std::nullopt;
@@ -563,37 +671,37 @@ std::optional<NavigationRecord> makeAssembledGalileo(const std::string& key,cons
     return std::nullopt;
   }
 }
-std::optional<NavigationRecord> makeAssembledBeiDou(const std::string& key,const std::vector<NavigationRecord>& pages,const std::optional<TimePoint>& refEpoch){
-  std::map<int,const NavigationRecord*> sf;
-  for (const auto& p : pages) {
-    auto it = p.fields.find("BeiDouD1Subframe");
-    if (it == p.fields.end()) continue;
-    int id = static_cast<int>(std::llround(it->second.value));
-    if (id >= 1 && id <= 5 && !sf.count(id)) sf[id] = &p;
-  }
+std::optional<NavigationRecord> makeAssembledBeiDouD1(const std::string& key,const std::map<int,NavigationRecord>& sf,const std::optional<TimePoint>& refEpoch){
   if (!sf.count(1) || !sf.count(2) || !sf.count(3)) return std::nullopt;
   auto get=[&](int id,const std::string& name)->std::optional<double>{
-    auto it = sf[id]->fields.find(name);
-    if (it == sf[id]->fields.end() || !std::isfinite(it->second.value)) return std::nullopt;
+    auto it = sf.at(id).fields.find(name);
+    if (it == sf.at(id).fields.end() || !std::isfinite(it->second.value)) return std::nullopt;
     return it->second.value;
   };
-  auto req=[&](int id,const std::string& name)->double{ auto v=get(id,name); if(!v) throw std::runtime_error("missing BeiDou "+name); return *v; };
+  auto req=[&](int id,const std::string& name)->double{ auto v=get(id,name); if(!v) throw std::runtime_error("missing BeiDou D1 "+name); return *v; };
   try {
-    NavigationRecord out=*sf[1]; out.messageSubtype="0"; out.rawLines.clear(); out.values.clear(); out.fields.clear();
-    out.rawLines.push_back("> EPH "+out.satellite+" "+out.messageType+" 0");
+    double sow1=req(1,"SOW"), sow2=req(2,"SOW"), sow3=req(3,"SOW");
+    if (!sowStep(sow1,sow2,6.0) || !sowStep(sow2,sow3,6.0)) return std::nullopt;
     double toe = (std::llround(req(2,"ToeMSB")) * 32768.0 + req(3,"ToeLS")) * 8.0;
+    double toc = req(1,"Toc");
     int week = static_cast<int>(std::llround(req(1,"Week")));
-    addStdField(out,"SV_clock_bias","s", req(1,"SV_clock_bias"));
-    addStdField(out,"SV_clock_drift","s/s", req(1,"SV_clock_drift"));
-    addStdField(out,"SV_clock_drift_rate","s/s^2", req(1,"SV_clock_drift_rate"));
+    double sqrtA=req(2,"SqrtA"), ecc=req(2,"Eccentricity"), af0=req(1,"SV_clock_bias"), af1=req(1,"SV_clock_drift"), af2=req(1,"SV_clock_drift_rate");
+    if (std::fabs(toe - toc) > 0.5) return std::nullopt;
+    if (!bdsOrbitPlausible(sqrtA,ecc,toe,toc,week,af0,af1,af2)) return std::nullopt;
+
+    NavigationRecord out=sf.at(1); out.messageSubtype="0"; out.rawLines.clear(); out.values.clear(); out.fields.clear();
+    out.rawLines.push_back("> EPH "+out.satellite+" "+out.messageType+" 0");
+    addStdField(out,"SV_clock_bias","s", af0);
+    addStdField(out,"SV_clock_drift","s/s", af1);
+    addStdField(out,"SV_clock_drift_rate","s/s^2", af2);
     addStdField(out,"AODE","", req(1,"AODE"));
     addStdField(out,"Crs","m", req(2,"Crs"));
     addStdField(out,"DeltaN","rad/s", req(2,"DeltaN"));
     addStdField(out,"M0","rad", req(2,"M0"));
     addStdField(out,"Cuc","rad", req(2,"Cuc"));
-    addStdField(out,"Eccentricity","", req(2,"Eccentricity"));
+    addStdField(out,"Eccentricity","", ecc);
     addStdField(out,"Cus","rad", req(2,"Cus"));
-    addStdField(out,"SqrtA","sqrt(m)", req(2,"SqrtA"));
+    addStdField(out,"SqrtA","sqrt(m)", sqrtA);
     addStdField(out,"Toe","s", toe);
     addStdField(out,"Cic","rad", req(3,"Cic"));
     addStdField(out,"Omega0","rad", req(3,"Omega0"));
@@ -610,23 +718,122 @@ std::optional<NavigationRecord> makeAssembledBeiDou(const std::string& key,const
     addStdField(out,"SatH1","", req(1,"SatH1"));
     addStdField(out,"TGD1","s", req(1,"TGD1"));
     addStdField(out,"TGD2","s", req(1,"TGD2"));
-    addStdField(out,"TransmissionTime","s", req(1,"TransmissionTime"));
-    out.epoch = bdsTimeFromWeekTow(week, req(1,"Toc"));
+    addStdField(out,"TransmissionTime","s", sow1);
+    out.epoch = bdsTimeFromWeekTow(week, toc);
     setInternalField(out,"OrbitUsable",1.0);
-    setInternalField(out,"Toc", req(1,"Toc"));
-    std::ostringstream l; l<<"    CEQC-BEIDOU-SFRBX-D1 decoded key="<<key<<" subframes=1,2,3";
+    setInternalField(out,"Toc", toc);
+    setInternalField(out,"Toe", toe);
+    std::ostringstream l; l<<"    CEQC-BEIDOU-SFRBX-D1 decoded key="<<key<<" subframes=1,2,3 sow="<<sow1<<","<<sow2<<","<<sow3<<" aode="<<req(1,"AODE");
     out.rawLines.push_back(l.str());
     return out;
   } catch (...) {
     return std::nullopt;
   }
 }
+
+std::optional<NavigationRecord> makeAssembledBeiDouD2(const std::string& key,const std::map<int,NavigationRecord>& pg,const std::optional<TimePoint>& refEpoch){
+  const int need[] = {1,3,4,5,6,7,8,9,10};
+  for (int id: need) if (!pg.count(id)) return std::nullopt;
+  auto get=[&](int id,const std::string& name)->std::optional<double>{
+    auto it = pg.at(id).fields.find(name);
+    if (it == pg.at(id).fields.end() || !std::isfinite(it->second.value)) return std::nullopt;
+    return it->second.value;
+  };
+  auto req=[&](int id,const std::string& name)->double{ auto v=get(id,name); if(!v) throw std::runtime_error("missing BeiDou D2 "+name); return *v; };
+  try {
+    double sow1=req(1,"SOW"), sow3=req(3,"SOW"), sow4=req(4,"SOW"), sow5=req(5,"SOW"), sow6=req(6,"SOW"), sow7=req(7,"SOW"), sow8=req(8,"SOW"), sow9=req(9,"SOW"), sow10=req(10,"SOW");
+    if (!sowStep(sow1,sow3,6.0) || !sowStep(sow3,sow4,3.0) || !sowStep(sow4,sow5,3.0) ||
+        !sowStep(sow5,sow6,3.0) || !sowStep(sow6,sow7,3.0) || !sowStep(sow7,sow8,3.0) ||
+        !sowStep(sow8,sow9,3.0) || !sowStep(sow9,sow10,3.0)) return std::nullopt;
+
+    int f1p3 = static_cast<int>(std::llround(req(3,"SV_clock_drift_P3_MSB")));
+    uint64_t f1p4 = static_cast<uint64_t>(std::llround(req(4,"SV_clock_drift_P4_LSB")));
+    int cucp4 = static_cast<int>(std::llround(req(4,"Cuc_P4_MSB")));
+    uint64_t cucp5 = static_cast<uint64_t>(std::llround(req(5,"Cuc_P5_LSB")));
+    int ep5 = static_cast<int>(std::llround(req(5,"Eccentricity_P5_MSB")));
+    uint64_t ep6 = static_cast<uint64_t>(std::llround(req(6,"Eccentricity_P6_LSB")));
+    int cicp6 = static_cast<int>(std::llround(req(6,"Cic_P6_MSB")));
+    uint64_t cicp7 = static_cast<uint64_t>(std::llround(req(7,"Cic_P7_LSB")));
+    int i0p7 = static_cast<int>(std::llround(req(7,"I0_P7_MSB")));
+    uint64_t i0p8 = static_cast<uint64_t>(std::llround(req(8,"I0_P8_LSB")));
+    int omgd8 = static_cast<int>(std::llround(req(8,"OmegaDot_P8_MSB")));
+    uint64_t omgd9 = static_cast<uint64_t>(std::llround(req(9,"OmegaDot_P9_LSB")));
+    int omg9 = static_cast<int>(std::llround(req(9,"Omega_P9_MSB")));
+    uint64_t omg10 = static_cast<uint64_t>(std::llround(req(10,"Omega_P10_LSB")));
+
+    auto mergeS=[&](int64_t ms, int msLen, uint64_t ls, int lsLen)->int64_t{
+      uint64_t msMask = (msLen>=64)?~0ULL:((1ULL<<msLen)-1ULL);
+      uint64_t lsMask = (lsLen>=64)?~0ULL:((1ULL<<lsLen)-1ULL);
+      uint64_t raw = ((static_cast<uint64_t>(ms) & msMask) << lsLen) | (ls & lsMask);
+      return signExtend(raw, msLen + lsLen);
+    };
+    auto mergeU=[&](uint64_t ms, uint64_t ls, int lsLen)->uint64_t{
+      uint64_t mask = (lsLen>=64)?~0ULL:((1ULL<<lsLen)-1ULL);
+      return (ms << lsLen) | (ls & mask);
+    };
+
+    double af0=req(3,"SV_clock_bias");
+    double af1=mergeS(f1p3,4,f1p4,18) * std::pow(2.0,-50);
+    double af2=req(4,"SV_clock_drift_rate");
+    double cuc=mergeS(cucp4,14,cucp5,4) * std::pow(2.0,-31);
+    double ecc=mergeU(static_cast<uint64_t>(ep5),ep6,22) * std::pow(2.0,-33);
+    double cic=mergeS(cicp6,10,cicp7,8) * std::pow(2.0,-31);
+    double i0=mergeS(i0p7,21,i0p8,11) * std::pow(2.0,-31) * PI_CONST;
+    double omgd=mergeS(omgd8,19,omgd9,5) * std::pow(2.0,-43) * PI_CONST;
+    double omg=mergeS(omg9,27,omg10,5) * std::pow(2.0,-31) * PI_CONST;
+    double sqrtA=req(6,"SqrtA"), toe=req(7,"Toe"), toc=req(1,"Toc");
+    int week=static_cast<int>(std::llround(req(1,"Week")));
+    if (std::fabs(toe - toc) > 0.5) return std::nullopt;
+    if (!bdsOrbitPlausible(sqrtA,ecc,toe,toc,week,af0,af1,af2)) return std::nullopt;
+
+    NavigationRecord out=pg.at(1); out.messageSubtype="0"; out.rawLines.clear(); out.values.clear(); out.fields.clear();
+    out.rawLines.push_back("> EPH "+out.satellite+" "+out.messageType+" 0");
+    addStdField(out,"SV_clock_bias","s", af0);
+    addStdField(out,"SV_clock_drift","s/s", af1);
+    addStdField(out,"SV_clock_drift_rate","s/s^2", af2);
+    addStdField(out,"AODE","", req(4,"AODE"));
+    addStdField(out,"Crs","m", req(8,"Crs"));
+    addStdField(out,"DeltaN","rad/s", req(4,"DeltaN"));
+    addStdField(out,"M0","rad", req(5,"M0"));
+    addStdField(out,"Cuc","rad", cuc);
+    addStdField(out,"Eccentricity","", ecc);
+    addStdField(out,"Cus","rad", req(5,"Cus"));
+    addStdField(out,"SqrtA","sqrt(m)", sqrtA);
+    addStdField(out,"Toe","s", toe);
+    addStdField(out,"Cic","rad", cic);
+    addStdField(out,"Omega0","rad", req(9,"Omega0"));
+    addStdField(out,"Cis","rad", req(7,"Cis"));
+    addStdField(out,"I0","rad", i0);
+    addStdField(out,"Crc","m", req(8,"Crc"));
+    addStdField(out,"Omega","rad", omg);
+    addStdField(out,"OmegaDot","rad/s", omgd);
+    addStdField(out,"IDOT","rad/s", req(10,"IDOT"));
+    addStdField(out,"AODC","", req(1,"AODC"));
+    addStdField(out,"Week","week", week);
+    addStdField(out,"Spare1","", 0.0);
+    addStdField(out,"SVAccuracy","m", req(1,"SVAccuracy"));
+    addStdField(out,"SatH1","", req(1,"SatH1"));
+    addStdField(out,"TGD1","s", req(1,"TGD1"));
+    addStdField(out,"TGD2","s", req(1,"TGD2"));
+    addStdField(out,"TransmissionTime","s", sow1);
+    out.epoch = bdsTimeFromWeekTow(week, toc);
+    setInternalField(out,"OrbitUsable",1.0);
+    setInternalField(out,"Toc", toc);
+    setInternalField(out,"Toe", toe);
+    std::ostringstream l; l<<"    CEQC-BEIDOU-SFRBX-D2 decoded key="<<key<<" pages=1,3,4,5,6,7,8,9,10 aode="<<req(4,"AODE");
+    out.rawLines.push_back(l.str());
+    return out;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
 class UBXTranslator final: public Translator { public:
 FormatInfo format() const override{return {"ubx",{"u-blox","ublox"},"u-blox UBX RAWX/SFRBX",true};}
 bool probe(const std::string& path,const std::vector<unsigned char>& p) const override{ if(p.size()>=2&&p[0]==0xB5&&p[1]==0x62)return true; std::string s((const char*)p.data(),p.size()); if(s.find("$GN")!=std::string::npos && s.find("u-blox")!=std::string::npos) return true; std::string l=path; for(auto&c:l)c=tolower(c); return l.find("ubx")!=std::string::npos; }
 std::vector<RinexFile> decode(const std::string& path) const override{
   std::ifstream f(path,std::ios::binary); if(!f) throw std::runtime_error("cannot open "+path); std::vector<unsigned char> b((std::istreambuf_iterator<char>(f)),{});
-  UBXSummary sum; sum.sourcePath=path; sum.bytesRead=(long long)b.size(); std::vector<ObservationRecord> recs; std::vector<NavigationRecord> navs; std::map<std::string,std::vector<std::string>> types; std::set<std::string> epochKeys; std::optional<TimePoint> firstRawxTime; std::optional<std::array<double,3>> ubxApproxXYZ; std::map<std::string,unsigned short> lastLockMs; std::map<std::string,std::map<int,NavigationRecord>> lnavSubframes; std::map<std::string,std::vector<NavigationRecord>> galPages; std::map<std::string,std::vector<NavigationRecord>> bdsPages; std::set<std::string> pageSeen; std::set<std::string> assembledSeen;
+  UBXSummary sum; sum.sourcePath=path; sum.bytesRead=(long long)b.size(); std::vector<ObservationRecord> recs; std::vector<NavigationRecord> navs; std::map<std::string,std::vector<std::string>> types; std::set<std::string> epochKeys; std::optional<TimePoint> firstRawxTime; std::optional<std::array<double,3>> ubxApproxXYZ; std::map<std::string,unsigned short> lastLockMs; std::map<std::string,std::map<int,NavigationRecord>> lnavSubframes; std::map<std::string,std::vector<NavigationRecord>> galPages; std::map<std::string,std::map<int,NavigationRecord>> bdsD1Subframes; std::map<std::string,std::map<int,NavigationRecord>> bdsD2Pages; std::set<std::string> pageSeen; std::set<std::string> assembledSeen;
   for(size_t i=0;i+8<b.size();++i){
     if(b[i]=='$'){ sum.nmeaLines++; while(i<b.size()&&b[i]!='\n')++i; continue; }
     if(!(i+1<b.size() && b[i]==0xB5 && b[i+1]==0x62)) continue;
@@ -711,8 +918,7 @@ std::vector<RinexFile> decode(const std::string& path) const override{
       auto nr=makeSFRBXRecord(pl,cls,id);
       int gnss=pl[0], sv=pl[1], sig=pl[2];
       int sf=0; if(auto it=nr.fields.find("LNAV_SubframeID"); it!=nr.fields.end()) sf=(int)it->second.value;
-      std::ostringstream pageKey;
-      pageKey << nr.system << ":" << nr.satellite << ":" << nr.messageType << ":" << sig << ":" << (sf ? sf : (nr.fields.count("PageID") ? static_cast<int>(nr.fields["PageID"].value) : 0));
+      int pageId = 0; if(auto it=nr.fields.find("PageID"); it!=nr.fields.end()) pageId = static_cast<int>(std::llround(it->second.value));
       if((nr.system=="G"||nr.system=="J") && sf>=1 && sf<=5){
         auto k=sfrbxKey(gnss,sv,sig); lnavSubframes[k][sf]=nr;
         if(lnavSubframes[k].count(1)&&lnavSubframes[k].count(2)&&lnavSubframes[k].count(3)) {
@@ -721,13 +927,40 @@ std::vector<RinexFile> decode(const std::string& path) const override{
           if(assembledSeen.insert(ak).second) navs.push_back(ar);
         }
       }
-      if(pageSeen.insert(pageKey.str()).second) {
-        // Raw SFRBX pages are useful for diagnostics but are not complete RINEX
-        // NAV ephemerides.  Emitting them as EPH records produces malformed NAV
-        // files in gfzrnx.  Keep them for assembly only; only fully assembled
-        // GPS/QZSS LNAV records are exported as NAV.
-        if(nr.system=="E") galPages[nr.satellite+":"+nr.messageType].push_back(nr);
-        if(nr.system=="C") bdsPages[nr.satellite+":"+nr.messageType].push_back(nr);
+      if(nr.system=="E") {
+        std::ostringstream pageKey;
+        pageKey << nr.system << ":" << nr.satellite << ":" << nr.messageType << ":" << sig << ":" << pageId;
+        if(pageSeen.insert(pageKey.str()).second) galPages[nr.satellite+":"+nr.messageType].push_back(nr);
+      }
+      if(nr.system=="C") {
+        auto k = sfrbxKey(gnss,sv,sig);
+        if(nr.messageType=="D1") {
+          auto it = nr.fields.find("BeiDouD1Subframe");
+          if(it != nr.fields.end()) {
+            int idd = static_cast<int>(std::llround(it->second.value));
+            if(idd>=1 && idd<=3) bdsD1Subframes[k][idd]=nr;
+            if(idd==3) {
+              if(auto ar = makeAssembledBeiDouD1(k, bdsD1Subframes[k], firstRawxTime)) {
+                std::string ak = bdsAssemblyKey(*ar);
+                if(assembledSeen.insert(ak).second) navs.push_back(*ar);
+              }
+            }
+          }
+        } else if(nr.messageType=="D2") {
+          auto it = nr.fields.find("BeiDouD2Page");
+          auto sfIt = nr.fields.find("BeiDouD2Subframe");
+          int d2sf = sfIt == nr.fields.end() ? 0 : static_cast<int>(std::llround(sfIt->second.value));
+          if(it != nr.fields.end() && d2sf == 1) {
+            int pgn = static_cast<int>(std::llround(it->second.value));
+            if(pgn>=1 && pgn<=10) bdsD2Pages[k][pgn]=nr;
+            if(pgn==10) {
+              if(auto ar = makeAssembledBeiDouD2(k, bdsD2Pages[k], firstRawxTime)) {
+                std::string ak = bdsAssemblyKey(*ar);
+                if(assembledSeen.insert(ak).second) navs.push_back(*ar);
+              }
+            }
+          }
+        }
       }
     }
     i+=7+len;
@@ -741,12 +974,9 @@ std::vector<RinexFile> decode(const std::string& path) const override{
       if(assembledSeen.insert(ak).second) navs.push_back(*ar);
     }
   }
-  for(auto& kv: bdsPages){
-    if(auto ar=makeAssembledBeiDou(kv.first, kv.second, firstRawxTime)){
-      std::string ak=ar->satellite+":"+ar->messageType+":"+ar->messageSubtype;
-      if(assembledSeen.insert(ak).second) navs.push_back(*ar);
-    }
-  }
+  // BeiDou D1/D2 is assembled online when the required consecutive
+  // subframes/pages arrive.  No macro bypass is used here: only ICD-consistent
+  // groups passing SOW and physical-range checks are promoted to formal EPH.
   RinexFile obs; obs.path=path; obs.header.kind=RinexKind::Obs; obs.header.version=3.05; obs.header.obsTypes=types; obs.data.observationRecords=std::move(recs); if(ubxApproxXYZ) obs.header.lines.push_back(mkHeaderLine(headerLineValueXYZ(*ubxApproxXYZ), "APPROX POSITION XYZ")); obs=ceqc::service::rinex::merge({obs},RinexKind::Obs,3.05); sum.epochCount=(int)epochKeys.size(); sum.observationCount=(int)obs.data.observationRecords.size(); sum.observationValueCount=0; for(auto&r:obs.data.observationRecords) for(auto&v:r.values) if(v.value) sum.observationValueCount++; obs.ubx=sum;
   std::vector<RinexFile> out{obs}; if(!navs.empty()){ RinexFile nav; nav.path=path; nav.header.kind=RinexKind::Nav; nav.header.version=4.02; nav.data.navigationRecords=navs; for(auto& n:navs) nav.body.insert(nav.body.end(),n.rawLines.begin(),n.rawLines.end()); nav=ceqc::service::rinex::merge({nav},RinexKind::Nav,4.02); out.push_back(nav); }
   return out;
