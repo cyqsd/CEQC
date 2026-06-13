@@ -44,6 +44,7 @@ struct QCDerivedSummary {
   std::map<std::string,QCMetricStats> snrStats, ionStats, iodStats, multipathStats, pseudorangePhase; int codeBandCount=0; int deletedObservations=0;
   int possibleObsAboveHorizon=0, possibleObsAboveMask=0, completeObsAboveMask=0, deletedObsAboveMask=0, maskedObsBelowMask=0, unknownElevationObs=0;
   double mp1Meters=0.0, mp2Meters=0.0; std::map<std::string,double> multipathMovingRMS; std::map<std::string,int> multipathMovingCount; int iodSlipsBelowMask=0, iodSlipsAboveMask=0, iodOrMPSlipsBelowMask=0, iodOrMPSlipsAboveMask=0;
+  int multipathCandidateRecords=0, multipathPairRecords=0; std::string multipathSkipReason;
   std::map<std::string,std::vector<int>> elevationBins;
   std::string timeplot;
   std::string obsTimeplot;

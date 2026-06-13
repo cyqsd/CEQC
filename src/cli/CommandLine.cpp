@@ -246,8 +246,8 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if (a == "++config") { op.showConfig = true; op.showAllConfig = true; }
     else if (a == "+bcf") op.showBCF = true;
     else if (a == "+formats" || a == "++formats" || a == "--formats") op.showFormats = true;
-    else if (a == "+rtklib" || a == "+rtkplot" || a == "--rtklib" || a == "--rtkplot") op.rtklibCompat = true;
-    else if (a == "-rtklib" || a == "-rtkplot") op.rtklibCompat = false;
+    else if (a == "+rtklib" || a == "+rtkplot") op.rtklibCompat = true;
+    else if (a == "-rtklib" || a == "-rtkplot") { /* teqc-style compatibility is enabled only with +rtklib/+rtkplot; ignore minus-form aliases */ }
     else if (a == "+verify") op.verifyOnly = true;
     else if (a == "+qc") op.qc = true;
     else if (a == "+qcq") { op.qc = true; op.quietQC = true; }

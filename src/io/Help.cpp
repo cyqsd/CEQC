@@ -16,7 +16,7 @@ General options:
 	-id or +id                write CEQC program id to stderr
 	-help or +help            output this CEQC on-line help to stderr
 	+formats                  list registered input translators and implementation status
-	+rtklib or +rtkplot       emit RTKLIB_EX/RTKPLOT-friendly OBS/NAV; keeps explicit +v3.05/+v4.02, uses legacy NAV body and RTKLIB signal aliases
+	+rtklib or +rtkplot       emit RTKLIB_EX/RTKPLOT-friendly OBS/NAV; teqc-style plus option only; use default mode by simply omitting it
 	+err name                 write stderr directly to file 'name'
 	++err name                append stderr directly to file 'name'
 	+out name                 write stdout directly to file 'name'
@@ -26,7 +26,7 @@ General options:
 	++config                  output a superset CEQC configuration template
 	+bcf                      output BINEX-style configuration template
 	-delim#                   change delimiter to # for separating file names (default = ,)
-	+teqc or --teqc-compat    render a teqc-style QC report
+	+teqc                    render a teqc-style QC report
 	-teqc_golden name         compare rendered report byte-for-byte with file 'name'
 	-teqc_diff name           write first byte-diff context to file 'name'
 	-teqc_eol lf|crlf         force LF or CRLF before golden comparison

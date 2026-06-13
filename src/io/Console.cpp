@@ -383,6 +383,7 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
     int mp1Samples=0, mp2Samples=0; auto m1=s.derived->multipathMovingCount.find("MP1"); if(m1!=s.derived->multipathMovingCount.end()) mp1Samples=m1->second; auto m2=s.derived->multipathMovingCount.find("MP2"); if(m2!=s.derived->multipathMovingCount.end()) mp2Samples=m2->second;
     if(mp1Samples>0) os << "MP1 computed            : samples=" << mp1Samples << " rms_m=" << std::fixed << std::setprecision(3) << s.derived->mp1Meters << "\n"; else os << "MP1 skipped             : samples=0\n";
     if(mp2Samples>0) os << "MP2 computed            : samples=" << mp2Samples << " rms_m=" << std::fixed << std::setprecision(3) << s.derived->mp2Meters << "\n"; else os << "MP2 skipped             : samples=0\n";
+    if(mp1Samples<=0 && mp2Samples<=0 && !s.derived->multipathSkipReason.empty()) os << "MP skip reason          : " << s.derived->multipathSkipReason << "\n";
     if(s.derived->ceqcExtensionEnabled || s.derived->dataIndicatorsEnabled){ for(const auto& kv:s.derived->histogramSamples){ if(kv.first=="ion"||kv.first=="mp") continue; if(s.derived->histograms.find(kv.first)==s.derived->histograms.end()) os << "CEQC-ext histogram " << kv.first << " : skipped samples=" << kv.second << "\n"; } for(const auto& kv:s.derived->histograms){ if(kv.first=="ion"||kv.first=="mp") continue; os << "CEQC-ext histogram " << kv.first << " : " << histogramText(kv.second) << " samples=" << (s.derived->histogramSamples.count(kv.first)?s.derived->histogramSamples.at(kv.first):0) << "\n"; } }
     for(const auto& w:s.derived->thresholdWarnings) os << "QC threshold warning    : " << w << "\n";
     if((s.derived->everyEpochXYZ||s.derived->everyEpochGeodetic||s.derived->everyEpochDecimal) && !s.derived->epochPositions.empty()){
@@ -410,15 +411,25 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
     int pct = expt > 0 ? static_cast<int>(std::lround(100.0 * completeObs / expt)) : 0;
     double mp1 = s.derived ? s.derived->mp1Meters : 0.0;
     double mp2 = s.derived ? s.derived->mp2Meters : 0.0;
+    int mp1Samples = 0, mp2Samples = 0;
+    if (s.derived) {
+      auto m1 = s.derived->multipathMovingCount.find("MP1"); if (m1 != s.derived->multipathMovingCount.end()) mp1Samples = m1->second;
+      auto m2 = s.derived->multipathMovingCount.find("MP2"); if (m2 != s.derived->multipathMovingCount.end()) mp2Samples = m2->second;
+    }
     int slips = s.derived ? (s.derived->clockSlipCount ? s.derived->clockSlipCount : (s.derived->iodSlipsAboveMask + s.derived->iodOrMPSlipsAboveMask)) : 0;
     os << "SUM " << teqcShortDate(*s.firstEpoch) << ' ' << teqcShortDate(*s.lastEpoch) << ' ' << std::fixed << std::setprecision(3)
        << ((std::chrono::duration<double>(*s.lastEpoch - *s.firstEpoch).count() + s.estimatedIntervalS) / 3600.0)
        << "  " << std::setprecision(0) << s.estimatedIntervalS;
     if (hasMask) {
-      os << "  " << std::setw(5) << expt << "  " << std::setw(5) << completeObs << ' ' << std::setw(3) << pct
-         << "  " << std::fixed << std::setprecision(2) << mp1 << "  " << mp2 << "  " << std::setw(5) << slips << "\n";
+      os << "  " << std::setw(5) << expt << "  " << std::setw(5) << completeObs << ' ' << std::setw(3) << pct << "  ";
+      if (mp1Samples > 0) os << std::fixed << std::setprecision(2) << mp1 << "  "; else os << "   -  ";
+      if (mp2Samples > 0) os << std::fixed << std::setprecision(2) << mp2 << "  "; else os << "   -  ";
+      os << std::setw(5) << slips << "\n";
     } else {
-      os << "     -  " << std::setw(6) << completeObs << "  -     -     -       0\n";
+      os << "     -  " << std::setw(6) << completeObs << "  -  ";
+      if (mp1Samples > 0) os << std::fixed << std::setprecision(2) << mp1 << "  "; else os << "   -  ";
+      if (mp2Samples > 0) os << std::fixed << std::setprecision(2) << mp2 << "  "; else os << "   -  ";
+      os << "     0\n";
     }
   }
 }
@@ -438,6 +449,7 @@ void printQC(std::ostream& os,const ceqc::model::QCSummary& s,bool quiet,bool te
     int mp1Samples=0, mp2Samples=0; auto m1=s.derived->multipathMovingCount.find("MP1"); if(m1!=s.derived->multipathMovingCount.end()) mp1Samples=m1->second; auto m2=s.derived->multipathMovingCount.find("MP2"); if(m2!=s.derived->multipathMovingCount.end()) mp2Samples=m2->second;
     if(mp1Samples>0) os<<"MP1 computed: samples="<<mp1Samples<<" rms_m="<<std::fixed<<std::setprecision(3)<<s.derived->mp1Meters<<"\n"; else os<<"MP1 skipped: samples=0\n";
     if(mp2Samples>0) os<<"MP2 computed: samples="<<mp2Samples<<" rms_m="<<std::fixed<<std::setprecision(3)<<s.derived->mp2Meters<<"\n"; else os<<"MP2 skipped: samples=0\n";
+    if(mp1Samples<=0 && mp2Samples<=0 && !s.derived->multipathSkipReason.empty()) os<<"MP skip reason: "<<s.derived->multipathSkipReason<<"\n";
     if(s.derived->ceqcExtensionEnabled || s.derived->dataIndicatorsEnabled){ for(const auto& kv:s.derived->histogramSamples){ if(kv.first=="ion"||kv.first=="mp") continue; if(s.derived->histograms.find(kv.first)==s.derived->histograms.end()) os<<"ceqc-ext histogram "<<kv.first<<": skipped samples="<<kv.second<<"\n"; } for(const auto& kv:s.derived->histograms){ if(kv.first=="ion"||kv.first=="mp") continue; os<<"ceqc-ext histogram "<<kv.first<<": "<<histogramText(kv.second)<<" samples="<<(s.derived->histogramSamples.count(kv.first)?s.derived->histogramSamples.at(kv.first):0)<<"\n"; } }
     for(const auto& w:s.derived->thresholdWarnings) os<<"qc-threshold-warning: "<<w<<"\n";
     if(s.derived->position.skippedNoNavigation){ os<<"position-qc: skipped=no_navigation candidate_epochs="<<s.derived->position.candidateEpochs<<" min_svs="<<s.derived->minSVsUsed<<"\n"; }

@@ -61,9 +61,10 @@ std::string kindFirst(RinexKind k, double v) {
       // used GPS" even though the content is valid GPS NAV.
       os << std::left << std::setw(20) << "N: GPS NAV DATA" << "                    ";
     } else if (rtklibCompat() && v >= 3.0) {
-      // RTKLIB_EX/RTKPLOT-compatible NAV uses a RINEX 3.05 mixed-GNSS header
-      // and the traditional untyped NAV body.  Do not emit RINEX-4 typed
-      // markers in this branch.
+      // RTKCONV-EX 2.5.0 writes mixed RINEX-3 NAV files with the GNSS NAV
+      // declaration.  Keep this non-strict fingerprint only in the explicit
+      // +rtklib/+rtkplot projection so RTKPlot imports RTCM3-derived mixed
+      // G/R/C navigation through the same parser path as its own converter.
       os << std::left << std::setw(20) << "N: GNSS NAV DATA" << "M: Mixed            ";
     } else {
       os << std::left << std::setw(20) << "NAVIGATION DATA" << "M                   ";
@@ -76,6 +77,7 @@ std::string kindFirst(RinexKind k, double v) {
 
 
 HeaderLine line(std::string v, std::string l);
+bool hasHeaderLabel(const RinexFile& out, const std::string& label);
 
 std::string utcNowCompact() {
   std::time_t now = std::time(nullptr);
@@ -170,13 +172,23 @@ double secOf(const TimePoint& t) {
   return static_cast<double>(tm.tm_sec) + frac;
 }
 
-std::string slot(const ObservationValue* v) {
-  // RTKLIB_EX/RTKPLOT is much more tolerant of RTKCONV-style blank LLI/SSI
-  // columns than of a carrier arc where every initial MSM lock state is marked
-  // with LLI=1.  Keep strict/mainline RINEX LLI/SSI intact, but in the explicit
-  // +rtklib/+rtkplot branch emit blank flag columns to match RTKCONV-EX golden
-  // plotting files.  This is a compatibility projection only; the source
-  // ObservationValue remains unchanged and normal output is unaffected.
+std::map<std::string, const ObservationValue*> valueMap(const ObservationRecord& r, bool v2);
+
+bool dropObsTypeForRtklibPlot(const std::string& code) {
+  // RTKLIB_EX 2.5.0's own RINEX export used by RTKPlot's GUI plots writes
+  // C/L/S triplets and omits Doppler observables.  Keep that non-strict
+  // projection only in explicit +rtklib/+rtkplot mode; the normal CEQC RINEX
+  // writer keeps D-observables untouched.
+  return rtklibCompat() && !code.empty() && code[0] == 'D';
+}
+
+std::string slot(const ObservationValue* v, const std::string& derivedSsi = "") {
+  (void)derivedSsi;
+  // Match RTKCONV-EX 2.5.0 in the explicit +rtklib/+rtkplot branch: leave the
+  // compact LLI/SSI columns blank and carry signal strength through S-observables
+  // only.  Writing derived 1..9 SSI here makes some RTKPlot views colour every
+  // arc by the legacy SSI bucket rather than by the SNR observable.  Mainline
+  // strict RINEX keeps the source LLI/SSI unchanged.
   auto lliCol = [&](const ObservationValue* vv) -> std::string {
     if (rtklibCompat()) return " ";
     return (!vv || vv->lli.empty()) ? " " : vv->lli.substr(0, 1);
@@ -282,6 +294,94 @@ double expandModuloWeek(double rawWeek, int modulo, const ceqc::model::TimePoint
   return static_cast<double>(full);
 }
 
+
+bool startsWithCopy(const std::string& x, const std::string& p) {
+  return x.rfind(p, 0) == 0;
+}
+
+std::optional<size_t> fieldIndex(const NavigationRecord& r, const std::string& name) {
+  auto it = r.fields.find(name);
+  if (it == r.fields.end()) return std::nullopt;
+  return it->second.index;
+}
+
+std::optional<double> fieldValue(const NavigationRecord& r, const std::string& name) {
+  auto it = r.fields.find(name);
+  if (it == r.fields.end()) return std::nullopt;
+  return it->second.value;
+}
+
+TimePoint sameDateSeconds(const TimePoint& ref, double secOfDay) {
+  auto tm = toUTC(ref);
+  return ceqc::model::makeUTC(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, 0, 0, 0.0) +
+         std::chrono::milliseconds(static_cast<long long>(std::llround(secOfDay * 1000.0)));
+}
+
+void normalizeRtklibRtcmNavValuesForOutput(const NavigationRecord& r, std::vector<double>& navVals) {
+  if (!rtklibCompat()) return;
+  if (!startsWithCopy(r.messageSubtype, "RTCM")) return;
+
+  if (r.system == "R") {
+    // RTKCONV-EX writes GLONASS clock bias as -tauN and writes tk as GPS-week
+    // seconds of the RTCM frame time, not seconds-of-day.  RTKPlot's skyplot/DOP
+    // path follows that convention; a seconds-of-day tk makes all RTCM3 GLO
+    // tracks collapse onto the north/south axis even though CEQC can read the
+    // same NAV internally.
+    if (!navVals.empty()) navVals[0] = -navVals[0];
+    auto tkIdx = fieldIndex(r, "MessageFrameTime");
+    if (tkIdx && *tkIdx < navVals.size() && r.epoch) {
+      double tk = navVals[*tkIdx];
+      if (std::isfinite(tk) && tk >= 0.0 && tk < 86400.0) {
+        navVals[*tkIdx] = secondsOfWeekFromEpoch(sameDateSeconds(*r.epoch, tk), 1980, 1, 6);
+      }
+    }
+    if (navVals.size() < 19) navVals.resize(19, 0.0);
+    // Match the extra RTKCONV-EX RTCM1020 tail fields closely enough for the GUI
+    // parser.  The first 15 RINEX GLONASS values remain the position-critical set.
+    if (navVals.size() >= 19) {
+      if (navVals[15] == 0.0) navVals[15] = 146.0;
+      if (auto h = fieldValue(r, "Health")) navVals[17] = *h;
+      if (navVals[18] == 0.0) navVals[18] = 3.0;
+    }
+    return;
+  }
+
+  if (r.system == "G" || r.system == "J") {
+    // RTKCONV-EX writes the GPS/QZSS fit interval as 4 hours for this RTCM3
+    // stream.  Keep the normal CEQC branch unchanged; the RTKPlot projection is
+    // intentionally converter-compatible rather than strict-minimal.
+    if (auto fitIdx = fieldIndex(r, "FitInterval")) {
+      if (*fitIdx < navVals.size() && navVals[*fitIdx] == 0.0) navVals[*fitIdx] = 4.0;
+    }
+    return;
+  }
+
+  if (r.system == "C") {
+    // BeiDou RTCM1042 in RTKCONV-EX/RINEX3 order keeps a spare zero after IDOT
+    // and writes AODC as the second value on the final line.  CEQC's strict path
+    // keeps all decoded fields in decode order; project to the RTKCONV layout
+    // only for +rtkplot so RTKPlot's BDS parser sees the same layout as the
+    // reference files supplied for this issue.
+    auto week = fieldValue(r, "Week").value_or(0.0);
+    auto aodc = fieldValue(r, "AODC").value_or(0.0);
+    auto ura = fieldValue(r, "SVAccuracy").value_or(0.0);
+    auto satH = fieldValue(r, "SatH1").value_or(0.0);
+    auto tgd1 = fieldValue(r, "TGD1").value_or(0.0);
+    auto tgd2 = fieldValue(r, "TGD2").value_or(0.0);
+    auto ttx = fieldValue(r, "TransmissionTime").value_or(fieldValue(r, "Toe").value_or(0.0));
+    if (navVals.size() < 30) navVals.resize(30, 0.0);
+    navVals[21] = 0.0;
+    navVals[22] = week;
+    navVals[23] = 0.0;
+    navVals[24] = ura > 0.0 ? ura : 2.0;
+    navVals[25] = satH;
+    navVals[26] = tgd1;
+    navVals[27] = tgd2;
+    navVals[28] = ttx;
+    navVals[29] = aodc;
+  }
+}
+
 void normalizeNavValuesForOutput(const NavigationRecord& r, std::vector<double>& navVals) {
   if (!r.epoch) return;
   auto patchField = [&](const std::string& name, int modulo) {
@@ -371,6 +471,7 @@ std::vector<std::string> formatNavRecord(const NavigationRecord& r, double versi
   if (version < 3.0 && r.system != "G") return out;
   std::vector<double> navVals = r.values;
   normalizeNavValuesForOutput(r, navVals);
+  normalizeRtklibRtcmNavValuesForOutput(r, navVals);
   // Anubis 3.11 evaluates GLONASS ephemeris usability from the extended
   // FDMA numeric record.  If RINEX3 writes only the legacy 15-value set while
   // RINEX4 writes 19 values, the same observations produce different GLO
@@ -510,6 +611,7 @@ std::map<std::string, std::vector<std::string>> observationTypes(const std::vect
       if (!hasFiniteObservationValue(val)) continue;
       auto mapped = outputObsCode(sys, val.type);
       auto code = v2 ? rinex2Code(mapped) : mapped;
+      if (dropObsTypeForRtklibPlot(code)) continue;
       if (std::find(tv.begin(), tv.end(), code) == tv.end()) tv.push_back(code);
     }
   }
@@ -554,6 +656,27 @@ void addV3ObsTypes(RinexFile& out, const std::map<std::string, std::vector<std::
       out.header.lines.push_back(line(v.str(), "SYS / # / OBS TYPES"));
     }
   }
+}
+
+
+bool hasSignalStrengthObservable(const std::map<std::string, std::vector<std::string>>& types) {
+  for (const auto& kv : types) {
+    for (const auto& code : kv.second) {
+      if (!code.empty() && code[0] == 'S') return true;
+    }
+  }
+  return false;
+}
+
+void addSignalStrengthUnit(RinexFile& out, const std::map<std::string, std::vector<std::string>>& types) {
+  if (!hasSignalStrengthObservable(types)) return;
+  if (hasHeaderLabel(out, "SIGNAL STRENGTH UNIT")) return;
+  // Strict CEQC RINEX declares that S-observables are C/N0 in dB-Hz.  RTKCONV-EX
+  // 2.5.0 does not write this header line, and RTKPlot's plotting path is
+  // closest to its own export when the line is absent, so omit it only in the
+  // explicit +rtklib/+rtkplot compatibility projection.
+  if (rtklibCompat()) return;
+  out.header.lines.push_back(line("DBHZ", "SIGNAL STRENGTH UNIT"));
 }
 
 void addV3PhaseShifts(RinexFile& out, const std::map<std::string, std::vector<std::string>>& types) {
@@ -705,7 +828,7 @@ void reorderRtklibObsHeader(RinexFile& out) {
     "RINEX VERSION / TYPE", "PGM / RUN BY / DATE", "COMMENT",
     "MARKER NAME", "MARKER NUMBER", "MARKER TYPE", "OBSERVER / AGENCY",
     "REC # / TYPE / VERS", "ANT # / TYPE", "APPROX POSITION XYZ", "ANTENNA: DELTA H/E/N",
-    "SYS / # / OBS TYPES", "TIME OF FIRST OBS", "TIME OF LAST OBS",
+    "SIGNAL STRENGTH UNIT", "SYS / # / OBS TYPES", "TIME OF FIRST OBS", "TIME OF LAST OBS",
     "SYS / PHASE SHIFT", "GLONASS SLOT / FRQ #", "GLONASS COD/PHS/BIS", "INTERVAL"
   };
   std::vector<HeaderLine> old = out.header.lines;
@@ -999,6 +1122,7 @@ RinexFile merge(const std::vector<RinexFile>& files, RinexKind kind, double targ
     addRequiredObsDefaults(out);
     applyRtklibObsMetadata(out);
     addGlonassSlotAndBiasHeaders(out, files);
+    if (!v2obs) addSignalStrengthUnit(out, types);
     if (v2obs) {
       auto tv = types.empty() ? std::vector<std::string>{} : types.begin()->second;
       addV2ObsTypes(out, tv);

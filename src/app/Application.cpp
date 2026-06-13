@@ -64,6 +64,7 @@ std::vector<std::string> candidateNavFilesForObs(const std::string& obsPath) {
   out.erase(std::unique(out.begin(), out.end()), out.end());
   return out;
 }
+
 bool alreadyLoadedPath(const std::vector<ceqc::model::RinexFile>& files, const std::string& path) {
   namespace fs = std::filesystem;
   std::error_code ec;
