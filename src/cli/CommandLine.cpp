@@ -14,6 +14,39 @@ namespace {
 bool has(const std::string& s, const std::string& p) { return s.rfind(p, 0) == 0; }
 double num(const std::string& s) { return std::stod(s); }
 
+bool nearVersion(double a, double b) { return std::fabs(a - b) < 5e-4; }
+
+double exactRinexVersionValue(double v) {
+  // normVer() treats mathematically integral values (3.00, 4.00) as a major
+  // request and maps them to CEQC defaults.  Add a tiny, non-printing epsilon
+  // for explicit .00 requests so the header still prints 3.00/4.00.
+  double major = std::floor(v + 1e-9);
+  if (std::fabs(v - major) < 1e-9) return v + 1e-6;
+  return v;
+}
+
+double parseRinexVersionOption(const std::string& opt) {
+  std::string vs = opt.substr(2);
+  if (vs.empty()) throw std::runtime_error("invalid RINEX version option " + opt);
+  if (vs == "2") return 2.11;
+  if (vs == "3") return 3.05;
+  if (vs == "4") return 4.02;
+  double v = 0.0;
+  try { v = std::stod(vs); }
+  catch (...) { throw std::runtime_error("invalid RINEX version option " + opt); }
+  // Keep the accepted list intentionally explicit.  CEQC must not silently emit
+  // a header version whose body/header profile has not been accepted for validation.
+  static const double supported[] = {
+    2.10, 2.11,
+    3.00, 3.01, 3.02, 3.03, 3.04, 3.05,
+    4.00, 4.01, 4.02
+  };
+  for (double ok : supported) if (nearVersion(v, ok)) return exactRinexVersionValue(ok);
+  throw std::runtime_error(
+    "unsupported RINEX version option " + opt +
+    "; supported versioned profiles: +v2/+v2.10/+v2.11, +v3/+v3.00..+v3.05, +v4/+v4.00..+v4.02");
+}
+
 std::vector<std::string> split(const std::string& s, char d=',') {
   std::vector<std::string> r;
   std::string x;
@@ -275,16 +308,7 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if (a == "+binex" && nextIsValue(args, i)) op.outputBinex = args[++i];
     else if (a == "-tr" && nextIsValue(args, i)) op.translatorName = args[++i];
     else if (a.rfind("+v",0)==0 && a.size()>2 && std::isdigit((unsigned char)a[2])) {
-      try {
-        std::string vs = a.substr(2);
-        op.targetVersion = std::stod(vs);
-        // Preserve explicit subversions such as +v3.00 or +v4.00.  A bare +v3/+v4
-        // means the CEQC default for that major series, while +v3.00 means exactly 3.00.
-        if (vs.find('.') != std::string::npos) {
-          double major = std::floor(op.targetVersion + 1e-9);
-          if (std::fabs(op.targetVersion - major) < 1e-9) op.targetVersion += 1e-6;
-        }
-      } catch(...) { throw std::runtime_error("invalid RINEX version option " + a); }
+      op.targetVersion = parseRinexVersionOption(a);
     }
     else if (a == "-max_rx_ch" || a == "-max_rx_channels") { if (nextIsValue(args,i)) op.maxRxChannels = std::stoi(args[++i]); }
     else if (a == "-max_rx_SVs") { if (nextIsValue(args,i)) { op.maxRxSVs = std::stoi(args[++i]); op.maxRxSVsSpecified = true; } }

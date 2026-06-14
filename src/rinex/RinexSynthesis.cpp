@@ -29,6 +29,13 @@ int systemOrderKey(const std::string& sys) {
   return 50;
 }
 
+double displayVersion(double v) {
+  // CommandLine.cpp preserves explicit +v3.00/+v4.00 with a tiny epsilon so
+  // normVer() does not collapse them to the family default.  All profile
+  // comparisons and header output should see the human version again.
+  return std::round(v * 100.0) / 100.0;
+}
+
 double normVer(double v, RinexKind k, double current = 0.0) {
   auto canonical = [&](double major) {
     if (major < 3) return 2.11;
@@ -38,14 +45,74 @@ double normVer(double v, RinexKind k, double current = 0.0) {
   if (v >= 2 && v < 5) {
     double major = std::floor(v + 1e-9);
     if (std::fabs(v - major) < 1e-9) return canonical(v);
-    return v; // explicit subversion, e.g. +v2.10, +v3.03, +v4.00
+    return displayVersion(v); // explicit subversion, e.g. +v2.10, +v3.03, +v4.00
   }
-  if (current >= 2 && current < 5) return current;
+  if (current >= 2 && current < 5) return displayVersion(current);
   return k == RinexKind::Nav ? 4.02 : 3.05;
 }
 
+int versionCmp(double v, double ref) {
+  v = displayVersion(v);
+  if (v < ref - 0.0005) return -1;
+  if (v > ref + 0.0005) return 1;
+  return 0;
+}
+
+bool versionAtLeast(double v, double ref) { return versionCmp(v, ref) >= 0; }
+bool versionBefore(double v, double ref) { return versionCmp(v, ref) < 0; }
+
+std::string versionProfileName(double v) {
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(2) << displayVersion(v);
+  return os.str();
+}
+
+bool systemAllowedByRinexProfile(double version, RinexKind kind, const std::string& sys) {
+  version = displayVersion(version);
+  if (sys.empty()) return true;
+
+  // RINEX 2.10/2.11 CEQC emits the conservative standard legacy profile:
+  // GPS/GLONASS observations and GPS LNAV navigation.  This avoids writing
+  // modern mixed-system records that only belong to later RINEX families or
+  // non-IGS RINEX2 extensions.
+  if (versionBefore(version, 3.0)) {
+    if (kind == RinexKind::Obs) return sys == "G" || sys == "R";
+    if (kind == RinexKind::Nav) return sys == "G";
+    return true;
+  }
+
+  // RINEX 3.00/3.01 profiles are limited to the early multi-GNSS family used
+  // for GPS/GLONASS/Galileo.  BDS/QZSS/SBAS are admitted from the RINEX 3.02
+  // current-GNSS profile onward.
+  if (versionBefore(version, 3.02)) {
+    return sys == "G" || sys == "R" || sys == "E";
+  }
+
+  // RINEX 3.02 supports the current GNSS constellation set used by CEQC
+  // test data (GPS/GLONASS/Galileo/QZSS/BDS/SBAS).  IRNSS/NavIC is kept for
+  // 3.03+ and 4.x because CEQC has no validated 3.02 NavIC test case.
+  if (versionBefore(version, 3.03)) {
+    return sys == "G" || sys == "R" || sys == "E" || sys == "C" || sys == "J" || sys == "S";
+  }
+
+  // RINEX 3.03+ and RINEX 4.x: allow every constellation CEQC can carry.
+  return sys == "G" || sys == "R" || sys == "E" || sys == "C" || sys == "J" || sys == "S" || sys == "I";
+}
+
+bool systemAllowedByRinexProfile(double version, RinexKind kind, const ObservationRecord& r) {
+  return systemAllowedByRinexProfile(version, kind, r.system.empty() ? "G" : r.system);
+}
+
+bool systemAllowedByRinexProfile(double version, RinexKind kind, const NavigationRecord& r) {
+  return systemAllowedByRinexProfile(version, kind, r.system.empty() ? (r.satellite.empty() ? "G" : r.satellite.substr(0,1)) : r.system);
+}
+
 std::string kindFirst(RinexKind k, double v) {
-  v = normVer(v, k, 0.0);
+  // merge() already normalizes the requested output version.  Do not call
+  // normVer() here again: an explicit +v3.00/+v4.00 would otherwise be
+  // recanonicalized to the family default +v3.05/+v4.02 only in the first
+  // header line.
+  v = displayVersion(v);
   std::ostringstream os;
   os << std::fixed << std::setw(9) << std::setprecision(2) << v << "           ";
   if (k == RinexKind::Obs) {
@@ -432,8 +499,20 @@ void normalizeNavValuesForOutput(const NavigationRecord& r, std::vector<double>&
     patchField("GPSWeek", 1024);
     patchTransmissionTime(secondsOfWeekFromEpoch(*r.epoch, 1980, 1, 6));
   } else if (r.system == "E") {
-    // Galileo GST week in RTCM is 12-bit; keep it continuous when an epoch is known.
-    patchField("Week", 4096);
+    // RINEX 3.05 section 4.1.3 requires the Galileo week written in NAV files
+    // to be continuous and aligned to the GPS week.  Raw Galileo/GST weeks
+    // decoded from broadcast pages start at the GPS 1024-rollover epoch, so
+    // project them to the GPS-aligned continuous scale before writing.
+    auto it = r.fields.find("Week");
+    if (it != r.fields.end() && it->second.index < navVals.size()) {
+      double raw = navVals[it->second.index];
+      if (std::isfinite(raw) && raw >= 0.0) {
+        int ref = gpsWeekFromEpoch(*r.epoch);
+        int base = static_cast<int>(std::llround(raw)) + 1024;
+        int k = static_cast<int>(std::llround(static_cast<double>(ref - base) / 4096.0));
+        navVals[it->second.index] = static_cast<double>(base + 4096 * k);
+      }
+    }
     patchTransmissionTime(secondsOfWeekFromEpoch(*r.epoch, 1999, 8, 22));
   } else if (r.system == "C") {
     patchTransmissionTime(secondsOfWeekFromEpoch(*r.epoch, 2006, 1, 1));
@@ -1104,17 +1183,9 @@ RinexFile merge(const std::vector<RinexFile>& files, RinexKind kind, double targ
   if (kind == RinexKind::Obs) {
     std::vector<ObservationRecord> recs;
     for (auto& f : files) if (f.header.kind == RinexKind::Obs) recs.insert(recs.end(), f.data.observationRecords.begin(), f.data.observationRecords.end());
-    if (v2obs) {
-      // RINEX 2 is a legacy observation format.  Modern constellations such as
-      // Galileo/BDS/QZSS can be represented only awkwardly in RINEX2 mixed files,
-      // and Anubis 3.11's RINEX2 reader treats long modern mixed epochs as
-      // incomplete/buffer-limited.  Keep RINEX2 output to the legacy systems that
-      // the RINEX2 QC path is intended to validate (GPS/GLONASS).  RINEX3/4
-      // remain the canonical output for BDS/GAL/QZS and keep all systems.
-      recs.erase(std::remove_if(recs.begin(), recs.end(), [](const ObservationRecord& r) {
-        return !(r.system == "G" || r.system == "R");
-      }), recs.end());
-    }
+    recs.erase(std::remove_if(recs.begin(), recs.end(), [&](const ObservationRecord& r) {
+      return !systemAllowedByRinexProfile(out.header.version, RinexKind::Obs, r);
+    }), recs.end());
     std::stable_sort(recs.begin(), recs.end(), [](auto& a, auto& b) { return a.time < b.time; });
     out.data.observationRecords = recs;
     auto types = observationTypes(recs, v2obs);
@@ -1178,6 +1249,9 @@ RinexFile merge(const std::vector<RinexFile>& files, RinexKind kind, double targ
     }
   }
   if (kind == RinexKind::Nav && !out.data.navigationRecords.empty()) {
+    out.data.navigationRecords.erase(std::remove_if(out.data.navigationRecords.begin(), out.data.navigationRecords.end(), [&](const NavigationRecord& r) {
+      return !systemAllowedByRinexProfile(out.header.version, RinexKind::Nav, r);
+    }), out.data.navigationRecords.end());
     if (!rtklibCompat()) {
       std::sort(out.data.navigationRecords.begin(), out.data.navigationRecords.end(), [](const auto& a, const auto& b) {
         if (a.satellite != b.satellite) return a.satellite < b.satellite;

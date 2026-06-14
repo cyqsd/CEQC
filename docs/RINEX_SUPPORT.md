@@ -19,10 +19,12 @@
 The command line accepts both major selectors and explicit subversions:
 
 - `+v2`, `+v2.10`, `+v2.11`
-- `+v3`, `+v3.00`, `+v3.03`, `+v3.04`, `+v3.05`
+- `+v3`, `+v3.00`, `+v3.01`, `+v3.02`, `+v3.03`, `+v3.04`, `+v3.05`
 - `+v4`, `+v4.00`, `+v4.01`, `+v4.02`
 
-A bare major selector uses ceqc's default subversion for that family; an explicit `.00/.03/.05` selector is kept as requested.
+A bare major selector uses CEQC's default subversion for that family; an explicit `.00/.03/.05` selector is kept as requested.
+
+Subversion-specific system gates and known gaps are documented in [`RINEX_VERSION_PROFILES.md`](RINEX_VERSION_PROFILES.md).
 
 
 ## 0.0.1 additions

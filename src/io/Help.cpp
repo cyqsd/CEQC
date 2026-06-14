@@ -40,6 +40,9 @@ Input and output:
 	+v2                       output RINEX 2.11 where possible
 	+v3                       output RINEX 3.05 where possible
 	+v4                       output RINEX 4.02 where possible
+	+v2.10/+v2.11             request a versioned RINEX 2 output profile
+	+v3.00..+v3.05            request a versioned RINEX 3 output profile
+	+v4.00..+v4.02            request a versioned RINEX 4 output profile
 	+nav_summary              output a compact NAV/SFRBX summary when available
 	+nav_assembled            output only assembled UBX SFRBX navigation records when available
 
