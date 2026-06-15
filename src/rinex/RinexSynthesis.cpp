@@ -222,6 +222,12 @@ HeaderLine line(std::string v, std::string l) {
   return {raw, raw.substr(0, 60), l};
 }
 
+
+std::string rtrimRecord(std::string s) {
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+  return s;
+}
+
 std::string padMin80(std::string s) {
   // RINEX records are traditionally transported as 80-column records.  RINEX
   // 3/4 OBS data records may legitimately exceed 80 columns, but NAV records
@@ -551,13 +557,14 @@ std::vector<std::string> formatNavRecord(const NavigationRecord& r, double versi
   std::vector<double> navVals = r.values;
   normalizeNavValuesForOutput(r, navVals);
   normalizeRtklibRtcmNavValuesForOutput(r, navVals);
-  // Anubis 3.11 evaluates GLONASS ephemeris usability from the extended
-  // FDMA numeric record.  If RINEX3 writes only the legacy 15-value set while
-  // RINEX4 writes 19 values, the same observations produce different GLO
-  // expected counts.  Keep RINEX3/4 same-source QC comparable by writing the
-  // extended 19-value GLONASS FDMA payload for RINEX3+; the RTCM1020-unavailable
-  // tail terms are neutral zeros and are not sample-specific.
-  if (version >= 3.0 && r.system == "R" && (mt == "FDMA" || mt.empty()) && navVals.size() < 19) {
+  // RINEX 3.05 and RINEX 4.x allow/use the extended GLONASS FDMA tail fields
+  // that CEQC also needs for strict same-source QC.  Older RINEX 3.00..3.04
+  // readers such as gfzrnx 2.2.0 expect the legacy 3 continuation rows only;
+  // writing the 4th continuation row there is parsed as an unsupported extra
+  // line after each R record.  Keep the extended tail only in profiles where it
+  // is accepted.
+  if (((version >= 3.05 && version < 4.0) || version >= 4.0) &&
+      r.system == "R" && (mt == "FDMA" || mt.empty()) && navVals.size() < 19) {
     navVals.resize(19, 0.0);
   }
   if (version >= 4.0 && !rtklibCompat()) {
@@ -621,6 +628,16 @@ std::map<std::string, std::vector<ObservationRecord>> buckets(const std::vector<
 std::string rinex2Code(std::string c) {
   if (c.size() >= 2) return c.substr(0, 2);
   return c;
+}
+
+bool rinex2ObsCodeSupported(const std::string& code) {
+  // Keep RINEX 2.x in the conservative GPS/GLO legacy profile.  A mixed
+  // RINEX2 header has a single global "# / TYPES OF OBSERV" list; if GPS L5
+  // creates C5/L5/S5 globally, strict tools such as gfzrnx/Anubis try to apply
+  // those types to GLONASS and reject or omit the data.  Do not advertise L5
+  // in RINEX2; use RINEX3+ for system-specific modern signals.
+  static const std::set<std::string> ok = {"C1","P1","L1","D1","S1","C2","P2","L2","D2","S2"};
+  return ok.count(code) > 0;
 }
 
 std::string outputObsCode(const std::string& sys, std::string code) {
@@ -690,6 +707,7 @@ std::map<std::string, std::vector<std::string>> observationTypes(const std::vect
       if (!hasFiniteObservationValue(val)) continue;
       auto mapped = outputObsCode(sys, val.type);
       auto code = v2 ? rinex2Code(mapped) : mapped;
+      if (v2 && !rinex2ObsCodeSupported(code)) continue;
       if (dropObsTypeForRtklibPlot(code)) continue;
       if (std::find(tv.begin(), tv.end(), code) == tv.end()) tv.push_back(code);
     }
@@ -703,6 +721,7 @@ std::map<std::string, const ObservationValue*> valueMap(const ObservationRecord&
   for (auto& v : r.values) {
     auto mapped = outputObsCode(r.system.empty() ? "G" : r.system, v.type);
     auto code = v2 ? rinex2Code(mapped) : mapped;
+    if (v2 && !rinex2ObsCodeSupported(code)) continue;
     if (!m.count(code)) m[code] = &v;
   }
   return m;
@@ -993,10 +1012,11 @@ void addGlonassSlotAndBiasHeaders(RinexFile& out, const std::vector<RinexFile>& 
     }
   }
   bool hasGloObs = out.header.obsTypes.count("R") || std::any_of(out.data.observationRecords.begin(), out.data.observationRecords.end(), [](const ObservationRecord& r){ return r.system == "R"; });
-  if (hasGloObs && !hasHeaderLabel(out, "GLONASS COD/PHS/BIS")) {
+  if (hasGloObs && out.header.version >= 3.01 && !hasHeaderLabel(out, "GLONASS COD/PHS/BIS")) {
     // No receiver-specific GLONASS code/phase bias is known from RTCM/UBX here.
-    // Writing explicit zero biases keeps RINEX3/4 headers complete for Anubis
-    // without inventing sample-specific corrections.
+    // Writing explicit zero biases keeps RINEX3.01+ / 4 headers complete for
+    // Anubis without inventing sample-specific corrections.  RINEX 3.00 does
+    // not accept this header label in gfzrnx, so the 3.00 profile omits it.
     out.header.lines.push_back(line(" C1C    0.000 C1P    0.000 C2C    0.000 C2P    0.000", "GLONASS COD/PHS/BIS"));
   }
 }
@@ -1178,6 +1198,9 @@ RinexFile merge(const std::vector<RinexFile>& files, RinexKind kind, double targ
     // teqc and strict RINEX 2 readers treat them as malformed header records.
     if (kind == RinexKind::Obs && v2obs &&
         (meta.label == "GLONASS SLOT / FRQ #" || meta.label == "GLONASS COD/PHS/BIS")) continue;
+    // gfzrnx validates GLONASS COD/PHS/BIS only from the later RINEX 3.x
+    // profile onward.  Do not copy the label into explicit +v3.00 output.
+    if (kind == RinexKind::Obs && out.header.version < 3.01 && meta.label == "GLONASS COD/PHS/BIS") continue;
     out.header.lines.push_back(meta);
   }
   if (kind == RinexKind::Obs) {

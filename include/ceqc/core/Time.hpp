@@ -47,6 +47,7 @@ inline TimePoint makeUTC(int year, int month, int day, int hour, int minute, dou
 #endif
   auto tp = std::chrono::system_clock::from_time_t(t);
   auto frac = second - static_cast<int>(second);
-  return tp + std::chrono::nanoseconds(static_cast<long long>(frac * 1e9 + 0.5));
+  return tp + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+    std::chrono::nanoseconds(static_cast<long long>(frac * 1e9 + 0.5)));
 }
 }
