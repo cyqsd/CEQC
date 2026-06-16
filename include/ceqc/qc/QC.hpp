@@ -52,6 +52,9 @@ struct QCDerivedSummary {
   std::string positionTimeplot;
   std::map<std::string,std::string> satelliteTimeplot;
   std::map<std::string,double> satelliteMaxElevationDeg;
+  // Azimuth at the sample where satelliteMaxElevationDeg was observed.
+  // Used only for native CEQC visual diagnostics; it is not written to RINEX.
+  std::map<std::string,double> satelliteMaxElevationAzimuthDeg;
   std::vector<int> obsBinCounts;
   std::vector<int> gpsSVsWithoutObs, gpsSVsWithoutNav, gpsUnhealthySVs, glonassSVsWithoutObs, glonassSVsWithoutNav; int freqTimeCodeCount=0, msecMpEventBins=0;
   int legacyGPSGLOSatellites=0, legacyPossibleObsAboveHorizon=0, legacyPossibleObsAboveMask=0, legacyCompleteObsAboveMask=0, legacyDeletedObsAboveMask=0, legacyMaskedObsBelowMask=0;

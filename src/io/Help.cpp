@@ -26,7 +26,7 @@ General options:
 	++config                  output a superset CEQC configuration template
 	+bcf                      output BINEX-style configuration template
 	-delim#                   change delimiter to # for separating file names (default = ,)
-	+teqc                    render a teqc-style QC report
+	+teqc                     render a teqc-style QC report (format branch only; main CEQC report is unchanged)
 	-teqc_golden name         compare rendered report byte-for-byte with file 'name'
 	-teqc_diff name           write first byte-diff context to file 'name'
 	-teqc_eol lf|crlf         force LF or CRLF before golden comparison
@@ -134,7 +134,7 @@ BINEX 0x00 metadata (-B.*):
 	-B.comment str             metadata comment
 
 Quality check modes:
-	+qc                        teqc-style CEQC quality-check report
+	+qc                        CEQC quality-check report
 	+qcq                       compact CEQC diagnostic summary
 	-qc / -qcq                 disable quality-check output
 	-nav file1[,file2...]      use auxiliary RINEX NAV files for QC/residuals

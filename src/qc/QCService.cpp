@@ -872,9 +872,24 @@ void buildTeqcTimeplotWithNav(const RinexFile& rf, const std::vector<NavigationR
       double frac = width<=1 ? 0.0 : (double)b/(double)(width-1);
       auto bt = first + std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(span*frac));
       double el=std::numeric_limits<double>::quiet_NaN();
+      double az=std::numeric_limits<double>::quiet_NaN();
       auto ephOpt=nearestEph(navs,sat,bt,opt);
-      if(ephOpt && recXYZ){ auto st=prop(*ephOpt, bt-std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(0.075))); if(st.ok) el=elevationRad(*recXYZ, sagnac(st.xyz,0.075)); }
-      if(std::isfinite(el)) d.satelliteMaxElevationDeg[sat]=std::max(d.satelliteMaxElevationDeg[sat], el*180.0/PI);
+      if(ephOpt && recXYZ){
+        auto st=prop(*ephOpt, bt-std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double>(0.075)));
+        if(st.ok){
+          auto sx = sagnac(st.xyz,0.075);
+          el=elevationRad(*recXYZ, sx);
+          az=azimuthRad(*recXYZ, sx);
+        }
+      }
+      if(std::isfinite(el)){
+        double eld = el*180.0/PI;
+        auto itMax = d.satelliteMaxElevationDeg.find(sat);
+        if(itMax==d.satelliteMaxElevationDeg.end() || eld > itMax->second){
+          d.satelliteMaxElevationDeg[sat]=eld;
+          if(std::isfinite(az)) d.satelliteMaxElevationAzimuthDeg[sat]=az*180.0/PI;
+        }
+      }
       bool obs = b < (int)obsBySatBin[sat].size() && obsBySatBin[sat][b] > 0;
       bool unhealthy = sat.size()>1 && sat[0]=='G' && unhealthyGPS.count(prnNumber(sat));
       rows[sat][b] = (unhealthy && !obs) ? ' ' : elevationSymbol(el, obs, opt.setMaskDeg, opt.setComparisonDeg);
@@ -1195,6 +1210,19 @@ void applyNavBasedQCMetrics(const RinexFile& rf, const std::vector<NavigationRec
     d.position.averageXYZ[0]=d.position.averageXYZ[1]=d.position.averageXYZ[2]=0.0;
     for(auto& sol:acceptedSols){ d.position.averageXYZ[0]+=sol[0]; d.position.averageXYZ[1]+=sol[1]; d.position.averageXYZ[2]+=sol[2]; }
     d.position.averageXYZ[0]/=acceptedSols.size(); d.position.averageXYZ[1]/=acceptedSols.size(); d.position.averageXYZ[2]/=acceptedSols.size();
+    if(d.position.hasApprox){
+      const double dx=d.position.averageXYZ[0]-d.position.approxXYZ[0];
+      const double dy=d.position.averageXYZ[1]-d.position.approxXYZ[1];
+      const double dz=d.position.averageXYZ[2]-d.position.approxXYZ[2];
+      const double delta=std::sqrt(dx*dx+dy*dy+dz*dz);
+      if(std::isfinite(delta) && delta>5.0){
+        std::ostringstream w;
+        w << "broadcast-code SPP mean differs from APPROX POSITION XYZ by "
+          << std::fixed << std::setprecision(3) << delta
+          << " m; header coordinate is kept as antenna reference, SPP mean is diagnostic only";
+        d.position.warnings.push_back(w.str());
+      }
+    }
   }
   buildTeqcTimeplotWithNav(rf, navs, posOpt, d);
   // Replace the eligibility-only position row with the quality-gated result.

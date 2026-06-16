@@ -404,7 +404,7 @@ int Application::run(const std::vector<std::string>& args) {
         s.navInputFiles = navPaths;
         s.navigationSatelliteAppearance = navSatAppear;
         if (rf.header.kind == RinexKind::Obs) qcSummariesForAux.push_back(s);
-        view::printQC(qout, s, op.quietQC, op.teqcCompat || !op.quietQC);
+        view::printQC(qout, s, op.quietQC, op.teqcCompat);
       }
       renderedQC = normalizeEOL(qout.str(), op.teqcEOL);
       out_ << renderedQC;
