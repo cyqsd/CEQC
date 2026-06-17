@@ -370,11 +370,42 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
     rightDate << b.tm_year + 1900 << ' ' << mon[b.tm_mon] << ' ' << std::setw(2) << b.tm_mday;
     os << teqcEndpointLine(leftDate.str(), rightDate.str()) << "\n";
   }
-  os << "\n*********************\nQC of RINEX  file(s) : " << (s.sourcePath.empty()?"<stdin>":s.sourcePath) << "\n";
-  if (!s.navInputFiles.empty()) {
-    os << "input RnxNAV file(s) : ";
-    for (size_t i = 0; i < s.navInputFiles.size(); ++i) { if (i) os << ' '; os << s.navInputFiles[i]; }
-    os << "\n";
+  auto displaySource = s.sourcePath.empty() ? std::string("<stdin>") : s.sourcePath;
+  std::string lowerSource = s.sourcePath;
+  std::transform(lowerSource.begin(), lowerSource.end(), lowerSource.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+  const bool navFromSameInput = std::find(s.navInputFiles.begin(), s.navInputFiles.end(), s.sourcePath) != s.navInputFiles.end();
+  const bool looksLikeRTCM3 = lowerSource.find("rtcm") != std::string::npos;
+  const bool looksLikeUBX = lowerSource.find("ubx") != std::string::npos || lowerSource.rfind(".dat") == lowerSource.size() - 4;
+  const bool rawSource = s.rtcm3.has_value() || s.ubx.has_value() || (navFromSameInput && s.kind == ceqc::model::RinexKind::Obs);
+  const std::string rawFormat = s.rtcm3 ? std::string("RTCM3") : (s.ubx ? std::string("UBX") : (looksLikeRTCM3 ? std::string("RTCM3") : (looksLikeUBX ? std::string("UBX/raw GNSS") : std::string("raw GNSS"))));
+  std::vector<std::string> externalNavInputs;
+  for (const auto& navPath : s.navInputFiles) {
+    if (rawSource && navPath == s.sourcePath) continue;
+    if (std::find(externalNavInputs.begin(), externalNavInputs.end(), navPath) == externalNavInputs.end()) {
+      externalNavInputs.push_back(navPath);
+    }
+  }
+
+  os << "\n*********************\n";
+  if (rawSource) {
+    os << "QC of raw GNSS file(s) : " << displaySource << "\n";
+    if (!s.navInputFiles.empty()) {
+      os << "navigation source     : decoded from " << rawFormat << " stream\n";
+    } else {
+      os << "navigation source     : none decoded from " << rawFormat << " stream\n";
+    }
+    if (!externalNavInputs.empty()) {
+      os << "input RnxNAV file(s) : ";
+      for (size_t i = 0; i < externalNavInputs.size(); ++i) { if (i) os << ' '; os << externalNavInputs[i]; }
+      os << "\n";
+    }
+  } else {
+    os << "QC of RINEX  file(s) : " << displaySource << "\n";
+    if (!s.navInputFiles.empty()) {
+      os << "input RnxNAV file(s) : ";
+      for (size_t i = 0; i < s.navInputFiles.size(); ++i) { if (i) os << ' '; os << s.navInputFiles[i]; }
+      os << "\n";
+    }
   }
   os << "*********************\n\n";
   std::string id = s.markerName.empty() ? "CEQC" : s.markerName.substr(0, std::min<size_t>(4, s.markerName.size()));
