@@ -125,6 +125,47 @@ void buildTeqcTimeplot(const RinexFile& rf, const QCOptions& opt, QCDerivedSumma
 }
 std::optional<double> f(const NavigationRecord& e,const std::string& name){ auto it=e.fields.find(name); if(it==e.fields.end()) return {}; return it->second.value; }
 std::optional<std::array<double,3>> approxXYZ(const RinexHeader& h){ auto it=h.byLabel.find("APPROX POSITION XYZ"); if(it==h.byLabel.end()||it->second.empty()) return {}; std::istringstream is(h.lines[it->second.front()].value); std::array<double,3> xyz{}; if(is>>xyz[0]>>xyz[1]>>xyz[2]) return xyz; return {}; }
+
+bool usableApproxXYZ(const std::optional<std::array<double,3>>& xyz){
+  if(!xyz) return false;
+  double n=std::sqrt((*xyz)[0]*(*xyz)[0]+(*xyz)[1]*(*xyz)[1]+(*xyz)[2]*(*xyz)[2]);
+  return std::isfinite(n) && n > 1.0e6;
+}
+std::string approxXYZValue(const std::array<double,3>& xyz){
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(4)
+     << std::setw(14) << xyz[0] << std::setw(14) << xyz[1] << std::setw(14) << xyz[2]
+     << "                  ";
+  return os.str();
+}
+std::string headerRawLine(const std::string& value, const std::string& label){
+  std::string v=value;
+  if(v.size()<60) v.append(60-v.size(),' ');
+  else if(v.size()>60) v.resize(60);
+  std::string l=label;
+  if(l.size()<20) l.append(20-l.size(),' ');
+  else if(l.size()>20) l.resize(20);
+  return v+l;
+}
+void upsertApproxXYZ(RinexHeader& h, const std::array<double,3>& xyz){
+  HeaderLine line;
+  line.value=approxXYZValue(xyz);
+  line.label="APPROX POSITION XYZ";
+  line.raw=headerRawLine(line.value,line.label);
+  auto it=h.byLabel.find(line.label);
+  if(it!=h.byLabel.end() && !it->second.empty() && it->second.front()<h.lines.size()){
+    h.lines[it->second.front()]=line;
+    return;
+  }
+  h.byLabel[line.label].push_back(h.lines.size());
+  h.lines.push_back(line);
+}
+std::vector<std::string> dedupStrings(const std::vector<std::string>& in){
+  std::vector<std::string> out;
+  std::set<std::string> seen;
+  for(const auto& s:in) if(seen.insert(s).second) out.push_back(s);
+  return out;
+}
 int codePriority(const std::string& system, const std::string& type){
   if(type.size()<2) return 10000;
   char k=type[0], b=type[1], c=type.size()>=3?type[2]:'_';
@@ -1366,7 +1407,43 @@ QCSummary analyze(const RinexFile& rf,const QCOptions& opt){ QCSummary s; s.sour
     if(opt.pseudorangePhase) d.pseudorangePhase["all"]=stat(prph);
     if(opt.multipath){ auto mpstat=stat(mpVals); mpstat.jumps=d.multipathStats["all"].jumps; d.multipathStats["all"]=mpstat; for(auto& skv: mpComboBasic){ for(auto& ckv: skv.second){ auto st=movingAverageMPStats(ckv.second,opt.mpWindow,true,opt.mpSigmas); if(st.count>0){ std::string key=skv.first+":"+ckv.first; d.multipathStats[key]=st; d.multipathMovingRMS[key]=st.rms; d.multipathMovingCount[key]=st.count; } } } int mp1c=0, mp2c=0; double mp1ss=0.0, mp2ss=0.0; for(const auto& kv:d.multipathStats){ if(kv.first.size()>=4 && kv.first.find("MP12")!=std::string::npos){ mp1c+=kv.second.count; mp1ss+=kv.second.rms*kv.second.rms*kv.second.count; } if(kv.first.size()>=4 && kv.first.find("MP21")!=std::string::npos){ mp2c+=kv.second.count; mp2ss+=kv.second.rms*kv.second.rms*kv.second.count; } } if(mp1c>0){ d.multipathMovingCount["MP1"]=mp1c; if(d.mp1Meters<=0) d.mp1Meters=std::sqrt(mp1ss/mp1c); } if(mp2c>0){ d.multipathMovingCount["MP2"]=mp2c; if(d.mp2Meters<=0) d.mp2Meters=std::sqrt(mp2ss/mp2c); } if(d.multipathMovingCount["MP1"]<=0 && d.multipathMovingCount["MP2"]<=0){ if(d.multipathCandidateRecords==0) d.multipathSkipReason="no code+carrier observations available for multipath"; else if(d.multipathPairRecords==0) d.multipathSkipReason="no dual-frequency code+carrier combinations in a single satellite epoch"; else d.multipathSkipReason="dual-frequency arcs too short or rejected by multipath moving-window filter"; } }
     if(opt.ion){ auto st=stat(ionVals); st.jumps=d.ionStats["all"].jumps; d.ionStats["all"]=st; d.histogramSamples["ion"]=(int)ionVals.size(); if(!ionVals.empty()) d.histograms["ion"]=histogramLinear(ionVals,opt.ionBins); } if(opt.iod){ auto st=stat({}); st.jumps=d.iodStats["all"].jumps; d.iodStats["all"]=st; } if(opt.snr){ d.histogramSamples["snr"]=(int)sn.size(); if(!sn.empty()) d.histograms["snr"]=histogramLinear(sn,opt.snBins,0.0,60.0); } if(opt.multipath){ d.histogramSamples["mp"]=(int)mpVals.size(); if(!mpVals.empty()) d.histograms["mp"]=histogramLinear(mpVals,opt.mpBins); } if(opt.pseudorangePhase){ d.histogramSamples["pseudorange_phase"]=(int)prph.size(); if(!prph.empty()) d.histograms["pseudorange_phase"]=histogramLinear(prph,opt.bins); } if(opt.pseudorangePhase && !prph.empty()){ auto pst=stat(prph); double sd=sampleStdDev(pst); if(sd>0 && std::fabs(pst.mean)>opt.codeSigmas*sd){ std::ostringstream w; w<<"code-sigma: mean exceeds "<<opt.codeSigmas<<" sigma gate"; d.thresholdWarnings.push_back(w.str()); } } d.deletedObservations=(d.codeBandCount<2?static_cast<int>(rf.data.observationRecords.size()):0); buildTeqcTimeplot(rf,opt,d); if(opt.symbolCodes||opt.allSymbols) d.symbolLegend={"c code/phase observation epoch","L loss-of-lock","g gap","N observed without navigation","2 incomplete dual-frequency","~ observed above mask","+ expected above mask","_ below mask","- below horizon"}; d.position.candidateEpochs=s.epochCount; d.position.skippedNoNavigation=(opt.averagePosition||opt.everyEpochPosition); d.position.attempted=false; d.position.epochSolutions=0; s.derived=d; } else if(rf.header.kind==RinexKind::Nav){ s.navigationRecords=(int)rf.data.navigationRecords.size(); for(auto& r:rf.data.navigationRecords){ s.navigationValues+=(int)r.values.size(); s.navigationFields+=(int)r.fields.size(); if(!r.satellite.empty())s.satelliteAppearance[r.satellite]++; if(r.epoch){ if(!s.firstEpoch||*r.epoch<*s.firstEpoch)s.firstEpoch=r.epoch; if(!s.lastEpoch||*r.epoch>*s.lastEpoch)s.lastEpoch=r.epoch; } } s.broadcastEphemerides=s.navigationRecords; } else if(rf.header.kind==RinexKind::Met){ s.meteorologicalRecords=(int)rf.data.meteorologicalRecords.size(); for(auto& r:rf.data.meteorologicalRecords) s.meteorologicalValues+=(int)r.values.size(); } return s; }
-QCSummary analyzeWithNavigation(const RinexFile& rf,const std::vector<NavigationRecord>& navs,const QCOptions& opt){ auto s=analyze(rf,opt); if(rf.header.kind==RinexKind::Obs&&!navs.empty()){ s.residuals=residual(rf,navs,opt); applyNavBasedQCMetrics(rf, navs, opt, s); } return s; }
+QCSummary analyzeWithNavigation(const RinexFile& rf,const std::vector<NavigationRecord>& navs,const QCOptions& opt){
+  // Raw translators can produce an OBS object before the RINEX writer has had a
+  // chance to back-fill APPROX POSITION XYZ.  Residual/rise-set/skyplot QC must
+  // not use an all-zero station; bootstrap the same SPP-derived reference that
+  // the translation path writes to RINEX, but keep this normalization in memory
+  // only.  This makes direct `ceqc +qc raw.ubx/raw.rtcm3` consistent with
+  // `ceqc -tr ...; ceqc +qc +nav out.nav out.obs` without inventing navigation
+  // data or altering the input stream.
+  RinexFile work=rf;
+  bool bootstrappedApprox=false;
+  if(work.header.kind==RinexKind::Obs && !navs.empty() && !usableApproxXYZ(approxXYZ(work.header))){
+    QCOptions seedOpt=opt;
+    // Match RINEX synthesis: bootstrap missing raw-stream APPROX XYZ from the
+    // conservative GPS/QZSS subset only.  Once a stable station reference is
+    // available, full CEQC QC can still evaluate BDS/Galileo/GLONASS normally.
+    seedOpt.noPositionSystems["C"]=true;
+    seedOpt.noPositionSystems["E"]=true;
+    seedOpt.noPositionSystems["R"]=true;
+    seedOpt.noPositionSystems["S"]=true;
+    seedOpt.noPositionSystems["I"]=true;
+    auto est=estimateApproxPositionInternal(work, navs, seedOpt);
+    if(est){
+      upsertApproxXYZ(work.header, *est);
+      bootstrappedApprox=true;
+    }
+  }
+  auto s=analyze(work,opt);
+  if(work.header.kind==RinexKind::Obs&&!navs.empty()){
+    s.residuals=residual(work,navs,opt);
+    applyNavBasedQCMetrics(work, navs, opt, s);
+    if(bootstrappedApprox && s.derived){
+      s.derived->position.warnings.push_back("APPROX POSITION XYZ was absent or zero; QC used a broadcast-code SPP bootstrap reference for residual, rise-set and skyplot diagnostics");
+    }
+    if(s.derived) s.derived->thresholdWarnings=dedupStrings(s.derived->thresholdWarnings);
+  }
+  return s;
+}
 std::string makePlot(const QCSummary& summary){
   auto axis = [](size_t width){
     if (width == 72) return std::string("-----------|-----------|-----------|-----------|-----------|-----------|");

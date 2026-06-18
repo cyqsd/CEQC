@@ -11,7 +11,7 @@ struct SVSelection { bool specified=false; bool includeMode=true; bool all=true;
 struct Operation {
   bool showHelp=false, showVersion=false, showID=false, showFormats=false, showConfig=false, showAllConfig=false, showBCF=false, verifyOnly=false, qc=false, quietQC=false, teqcCompat=false;
   std::string outputObs, outputNav, outputMet, outputBinex, translatorName; double targetVersion=0;
-  std::vector<std::string> configFiles; std::string teqcGolden, teqcDiff, teqcEOL="lf";
+  std::vector<std::string> configFiles; std::string teqcGolden, teqcDiff, teqcEOL="lf"; std::string qcJsonPath;
   std::map<std::string,std::string> obsHeaderEdits, navHeaderEdits, metHeaderEdits, headerEdits, binexMetadata;
   std::vector<std::string> extractLabels; std::optional<TimePoint> windowStart, windowEnd;
   DecimationSpec obsDecimation, navDecimation, metDecimation; std::string obsSummaryTarget; bool obsSummaryAppend=false;

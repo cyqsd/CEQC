@@ -289,6 +289,8 @@ Operation parseArgs(const std::vector<std::string>& rawArgs) {
     else if (a == "-teqc_golden" && nextIsValue(args, i)) op.teqcGolden = args[++i];
     else if (a == "-teqc_diff" && nextIsValue(args, i)) op.teqcDiff = args[++i];
     else if (a == "-teqc_eol" && nextIsValue(args, i)) op.teqcEOL = lower(args[++i]);
+    else if ((a == "+qc_json" || a == "+qc-json" || a == "+json_qc" || a == "+qcjson") && nextIsValue(args, i)) { op.qcJsonPath = args[++i]; op.qc = true; }
+    else if ((a == "-qc_json" || a == "-qc-json") && nextIsValue(args, i)) { op.qcJsonPath = args[++i]; op.qc = true; }
     else if (a == "+obs" && nextIsValue(args, i)) op.outputObs = args[++i];
     else if (a == "+nav" && nextIsValue(args, i)) {
       std::string v = args[++i];

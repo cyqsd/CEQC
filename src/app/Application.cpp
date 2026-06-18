@@ -4,6 +4,7 @@
 #include "ceqc/rinex/RinexService.hpp"
 #include "ceqc/translate/Translator.hpp"
 #include "ceqc/io/Console.hpp"
+#include "ceqc/io/QCJson.hpp"
 #include <algorithm>
 #include <cctype>
 #include <fstream>
@@ -390,10 +391,16 @@ int Application::run(const std::vector<std::string>& args) {
       std::vector<NavigationRecord> navs;
       std::vector<std::string> navPaths;
       std::map<std::string,int> navSatAppear;
+      int navValueCount = 0;
+      int navFieldCount = 0;
       for (auto& rf : files) if (rf.header.kind == RinexKind::Nav) {
         navPaths.push_back(rf.path);
         navs.insert(navs.end(), rf.data.navigationRecords.begin(), rf.data.navigationRecords.end());
-        for (auto& nr : rf.data.navigationRecords) if(!nr.satellite.empty()) navSatAppear[nr.satellite]++;
+        for (auto& nr : rf.data.navigationRecords) {
+          if(!nr.satellite.empty()) navSatAppear[nr.satellite]++;
+          navValueCount += static_cast<int>(nr.values.size());
+          navFieldCount += static_cast<int>(nr.fields.size());
+        }
       }
       bool hasObsForQC = false;
       for (auto& rf : files) if (rf.header.kind == RinexKind::Obs) hasObsForQC = true;
@@ -403,12 +410,55 @@ int Application::run(const std::vector<std::string>& args) {
         auto s = navs.empty() ? service::qc::analyze(rf, op.qcOptions) : service::qc::analyzeWithNavigation(rf, navs, op.qcOptions);
         s.navInputFiles = navPaths;
         s.navigationSatelliteAppearance = navSatAppear;
+        if (rf.header.kind == RinexKind::Obs && !navs.empty()) {
+          s.navigationRecords = static_cast<int>(navs.size());
+          s.navigationValues = navValueCount;
+          s.navigationFields = navFieldCount;
+          s.broadcastEphemerides = static_cast<int>(navs.size());
+        }
         if (rf.header.kind == RinexKind::Obs) qcSummariesForAux.push_back(s);
         view::printQC(qout, s, op.quietQC, op.teqcCompat);
       }
       renderedQC = normalizeEOL(qout.str(), op.teqcEOL);
       out_ << renderedQC;
       compareGolden(renderedQC, op, err_);
+      if (!op.qcJsonPath.empty()) {
+        if (op.teqcCompat) {
+          err_ << "ceqc: warning: +qc_json is ignored when +teqc rendering is active; JSON is native CEQC QC only\n";
+        } else {
+          std::ostream* jout = nullptr;
+          std::ofstream jf;
+          if (op.qcJsonPath == "-" || op.qcJsonPath == "stdout") {
+            jout = &out_;
+          } else {
+            jf.open(op.qcJsonPath, std::ios::binary);
+            if (!jf) throw std::runtime_error("cannot create QC JSON file: " + op.qcJsonPath);
+            jout = &jf;
+          }
+          if (qcSummariesForAux.size() == 1) {
+            view::writeQCJson(*jout, qcSummariesForAux.front());
+          } else {
+            *jout << "{\n  \"schema\": \"ceqc-qc-json-collection-v1\",\n  \"reports\": [\n";
+            for (size_t qi = 0; qi < qcSummariesForAux.size(); ++qi) {
+              std::ostringstream js;
+              view::writeQCJson(js, qcSummariesForAux[qi]);
+              std::string body = js.str();
+              // Indent each embedded report without reparsing it.
+              std::istringstream lines(body);
+              std::string line;
+              bool firstLine = true;
+              while (std::getline(lines, line)) {
+                if (!firstLine) *jout << "\n";
+                *jout << "    " << line;
+                firstLine = false;
+              }
+              if (qi + 1 < qcSummariesForAux.size()) *jout << ",";
+              *jout << "\n";
+            }
+            *jout << "  ]\n}\n";
+          }
+        }
+      }
     }
 
     auto rtklibTargetVersion = [&](RinexKind kind) {

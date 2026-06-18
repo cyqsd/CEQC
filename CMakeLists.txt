@@ -20,6 +20,7 @@ add_library(ceqc_core
   src/app/Application.cpp
   src/cli/CommandLine.cpp
   src/io/Console.cpp
+  src/io/QCJson.cpp
   src/io/Help.cpp
   src/rinex/RinexParser.cpp
   src/rinex/RinexWriter.cpp

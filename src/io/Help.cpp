@@ -27,6 +27,7 @@ General options:
 	+bcf                      output BINEX-style configuration template
 	-delim#                   change delimiter to # for separating file names (default = ,)
 	+teqc                     render a teqc-style QC report (format branch only; main CEQC report is unchanged)
+	+qc_json name             write native +qc results as chart-friendly JSON; ignored by +teqc rendering
 	-teqc_golden name         compare rendered report byte-for-byte with file 'name'
 	-teqc_diff name           write first byte-diff context to file 'name'
 	-teqc_eol lf|crlf         force LF or CRLF before golden comparison
@@ -136,6 +137,7 @@ BINEX 0x00 metadata (-B.*):
 Quality check modes:
 	+qc                        CEQC quality-check report
 	+qcq                       compact CEQC diagnostic summary
+	+qc_json name              write native CEQC QC JSON for charts/statistics; not used by +teqc
 	-qc / -qcq                 disable quality-check output
 	-nav file1[,file2...]      use auxiliary RINEX NAV files for QC/residuals
 	+nav file1[,file2...]      teqc-compatible QC alias for -nav when +qc/+qcq is used
@@ -185,6 +187,7 @@ Quality check modes:
 Examples:
 	ceqc +verify file.23o
 	ceqc +qc file.23o
+	ceqc +qc +qc_json qc.json file.23o
 	ceqc -tr rtcm3 +v3 +obs out.26o +nav out.26p raw.rtcm3
 	ceqc -tr ubx +v2 +G +obs gps.26o raw.ubx
 	ceqc +qc +teqc -teqc_golden teqc.qc -teqc_diff diff.txt file.26o
