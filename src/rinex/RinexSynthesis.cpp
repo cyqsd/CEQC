@@ -1233,6 +1233,11 @@ RinexFile merge(const std::vector<RinexFile>& files, RinexKind kind, double targ
     if (v2obs) makeV2Body(out, recs, out.header.obsTypes["G"]);
     else makeV3Body(out, recs, types);
     parseContent(out);
+    for (const auto& f : files) {
+      if (f.header.kind != kind) continue;
+      if (!out.rtcm3 && f.rtcm3) out.rtcm3 = f.rtcm3;
+      if (!out.ubx && f.ubx) out.ubx = f.ubx;
+    }
     return out;
   }
 
@@ -1296,6 +1301,11 @@ RinexFile merge(const std::vector<RinexFile>& files, RinexKind kind, double targ
   }
   out.header.lines.push_back(line("", "END OF HEADER"));
   indexHeader(out.header);
+  for (const auto& f : files) {
+    if (f.header.kind != kind) continue;
+    if (!out.rtcm3 && f.rtcm3) out.rtcm3 = f.rtcm3;
+    if (!out.ubx && f.ubx) out.ubx = f.ubx;
+  }
   return out;
 }
 

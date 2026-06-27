@@ -1,4 +1,5 @@
 #include "ceqc/app/Application.hpp"
+#include "ceqc/core/Version.hpp"
 #include "ceqc/cli/CommandLine.hpp"
 #include "ceqc/qc/QCService.hpp"
 #include "ceqc/rinex/RinexService.hpp"
@@ -312,7 +313,7 @@ int Application::run(const std::vector<std::string>& args) {
     auto op = ceqc::cli::parseArgs(args);
     if (op.showHelp || args.empty()) { view::printHelp(err_); return 0; }
     if (op.showVersion) { view::printVersion(err_); return 0; }
-    if (op.showID) { err_ << "ceqc 0.0.1 C++21-cleanroom\n"; return 0; }
+    if (op.showID) { err_ << ceqc::CEQC_VERSION_STRING << "\n"; return 0; }
     if (op.showConfig || op.showBCF) { printConfig(out_, op, op.showAllConfig, op.showBCF); return 0; }
 
     service::translator::Registry reg;

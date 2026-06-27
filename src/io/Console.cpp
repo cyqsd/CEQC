@@ -1,4 +1,5 @@
 #include "ceqc/io/Console.hpp"
+#include "ceqc/core/Version.hpp"
 #include "ceqc/io/Help.hpp"
 #include <algorithm>
 #include <cmath>
@@ -213,6 +214,47 @@ std::vector<std::pair<std::string,std::string>> sortedTimeplotRows(const ceqc::m
   return rows;
 }
 
+
+bool isLegacyTeqcSatellite(const std::string& sat) {
+  return !sat.empty() && (sat[0] == 'G' || sat[0] == 'R');
+}
+
+std::string lowerCopy(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
+std::string basenameCopy(const std::string& path) {
+  size_t p = path.find_last_of("/\\");
+  return p == std::string::npos ? path : path.substr(p + 1);
+}
+
+std::string stemCopy(const std::string& name) {
+  size_t p = name.find_last_of('.');
+  return p == std::string::npos ? name : name.substr(0, p);
+}
+
+std::string extCopy(const std::string& name) {
+  size_t p = name.find_last_of('.');
+  return p == std::string::npos ? std::string{} : name.substr(p);
+}
+
+bool isAutoRawNavAlias(const std::string& source, const std::string& navPath) {
+  const std::string sb = lowerCopy(basenameCopy(source));
+  const std::string nb = lowerCopy(basenameCopy(navPath));
+  if (sb.empty() || nb.empty()) return false;
+  if (sb == nb) return true;
+  const std::string sstem = stemCopy(sb);
+  const std::string nstem = stemCopy(nb);
+  const std::string ne = extCopy(nb);
+  if (sstem != nstem) return false;
+  if (ne == ".nav" || ne == ".rnx") return true;
+  // Common RINEX NAV aliases produced next to a raw stream, e.g. .26n/.26p.
+  return ne.size() == 4 && std::isdigit(static_cast<unsigned char>(ne[1])) &&
+         std::isdigit(static_cast<unsigned char>(ne[2])) &&
+         (ne[3] == 'n' || ne[3] == 'p' || ne[3] == 'g' || ne[3] == 'l');
+}
+
 std::string timeplotLabel(const std::string& sat) {
   if (sat.empty()) return "";
   if (sat[0] == 'G') {
@@ -339,11 +381,12 @@ void printNativeSkyplot(std::ostream& os, const ceqc::model::QCDerivedSummary& d
 }
 
 void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
-  os << "version: ceqc  0.0.1\n\n";
+  os << "version: ceqc  " << ceqc::CEQC_VERSION << "\n\n";
   std::string obsLine = (s.derived && !s.derived->obsTimeplot.empty()) ? s.derived->obsTimeplot : std::string(72, ' ');
   os << " SV+-----------|-----------|-----------|-----------|-----------|-----------|+ SV\n";
   if (s.derived) {
     for (const auto& kv : sortedTimeplotRows(*s.derived)) {
+      if (!isLegacyTeqcSatellite(kv.first)) continue;
       std::string lab = timeplotLabel(kv.first);
       os << std::setw(3) << lab << '|' << kv.second << '|' << std::setw(3) << lab << "\n";
     }
@@ -371,8 +414,7 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
     os << teqcEndpointLine(leftDate.str(), rightDate.str()) << "\n";
   }
   auto displaySource = s.sourcePath.empty() ? std::string("<stdin>") : s.sourcePath;
-  std::string lowerSource = s.sourcePath;
-  std::transform(lowerSource.begin(), lowerSource.end(), lowerSource.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+  std::string lowerSource = lowerCopy(s.sourcePath);
   const bool navFromSameInput = std::find(s.navInputFiles.begin(), s.navInputFiles.end(), s.sourcePath) != s.navInputFiles.end();
   const bool looksLikeRTCM3 = lowerSource.find("rtcm") != std::string::npos;
   const bool looksLikeUBX = lowerSource.find("ubx") != std::string::npos || lowerSource.rfind(".dat") == lowerSource.size() - 4;
@@ -380,16 +422,18 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
   const std::string rawFormat = s.rtcm3 ? std::string("RTCM3") : (s.ubx ? std::string("UBX") : (looksLikeRTCM3 ? std::string("RTCM3") : (looksLikeUBX ? std::string("UBX/raw GNSS") : std::string("raw GNSS"))));
   std::vector<std::string> externalNavInputs;
   for (const auto& navPath : s.navInputFiles) {
-    if (rawSource && navPath == s.sourcePath) continue;
+    if (rawSource && (navPath == s.sourcePath || isAutoRawNavAlias(s.sourcePath, navPath))) continue;
     if (std::find(externalNavInputs.begin(), externalNavInputs.end(), navPath) == externalNavInputs.end()) {
       externalNavInputs.push_back(navPath);
     }
   }
+  const bool rawDecodedNav = rawSource && (s.navigationRecords > 0 || !s.navigationSatelliteAppearance.empty() ||
+      (s.rtcm3 && !s.rtcm3->ephemeris.empty()) || (s.ubx && s.ubx->sfrbxCount > 0));
 
   os << "\n*********************\n";
   if (rawSource) {
     os << "QC of raw GNSS file(s) : " << displaySource << "\n";
-    if (!s.navInputFiles.empty()) {
+    if (rawDecodedNav) {
       os << "navigation source     : decoded from " << rawFormat << " stream\n";
     } else {
       os << "navigation source     : none decoded from " << rawFormat << " stream\n";
@@ -408,7 +452,10 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
     }
   }
   os << "*********************\n\n";
-  std::string id = s.markerName.empty() ? "CEQC" : s.markerName.substr(0, std::min<size_t>(4, s.markerName.size()));
+  std::string id;
+  if (!s.markerNumber.empty() && s.markerNumber != "UNKNOWN") id = s.markerNumber.substr(0, std::min<size_t>(4, s.markerNumber.size()));
+  else if (!s.markerName.empty()) id = s.markerName.substr(0, std::min<size_t>(4, s.markerName.size()));
+  else id = "0000";
   os << "4-character ID          : " << id << "\n";
   std::string rtype = s.receiverType.empty()?"UNKNOWN":s.receiverType;
   std::string rnum = s.receiverNumber.empty()?"UNKNOWN":s.receiverNumber;
@@ -510,49 +557,16 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
     os << "Complete obs >  10.0 deg: " << std::setw(6) << completeObs << "\n";
     os << " Deleted obs >  10.0 deg: " << std::setw(6) << deletedObs << "\n";
     os << "  Masked obs <  10.0 deg: " << std::setw(6) << maskedObs10 << "\n";
-    if (s.derived->ceqcExtensionEnabled && teqcLegacyScope) {
-      os << "ceqc-ext all GNSS poss >  0: " << std::setw(6) << s.derived->possibleObsAboveHorizon << "\n";
-      os << "ceqc-ext all GNSS poss > 10: " << std::setw(6) << s.derived->possibleObsAboveMask << "\n";
-      os << "ceqc-ext all GNSS have > 10: " << std::setw(6) << s.derived->completeObsAboveMask << "\n";
-      os << "ceqc-ext all GNSS del  > 10: " << std::setw(6) << s.derived->deletedObsAboveMask << "\n";
-      os << "ceqc-ext all GNSS mask < 10: " << std::setw(6) << s.derived->maskedObsBelowMask << "\n";
-    }
   } else {
     os << "Complete observations   : " << std::setw(6) << completeObs << "\n";
     os << " Deleted observations   : " << std::setw(6) << deletedObs << "\n";
   }
   os << "Obs w/ SV duplication   :      0  (within non-repeated epochs)\n";
-  if (s.derived && s.derived->ceqcExtensionEnabled && teqcLegacyScope) {
-    os << "ceqc-ext legacy scope   : GPS/GLONASS legacy L1/L2 metrics used for teqc-compatible summary lines; all-GNSS metrics are reported in ceqc-ext lines.\n";
-  }
   if (s.derived && s.derived->mp1Meters > 0) os << "Moving average MP12     : " << std::fixed << std::setprecision(6) << s.derived->mp1Meters << " m\n";
   if (s.derived && s.derived->mp2Meters > 0) os << "Moving average MP21     : " << std::fixed << std::setprecision(6) << s.derived->mp2Meters << " m\n";
-  if (s.derived && s.derived->multipathEnabled && s.derived->ceqcExtensionEnabled) {
-    std::vector<std::pair<std::string,double>> mps(s.derived->multipathMovingRMS.begin(), s.derived->multipathMovingRMS.end());
-    std::sort(mps.begin(), mps.end(), [](const auto& a,const auto& b){ return a.first < b.first; });
-    if(!mps.empty()) {
-      os << "CEQC modern-only multipath combinations:\n";
-      os << "  Note: not directly comparable with teqc 2019; includes BDS-3/Galileo/QZSS/multi-frequency combinations when present.\n";
-      os << "  SYS  COMBO        BANDS                  RMS(m)    N     FLAG\n";
-    }
-    for (auto& kv : mps) {
-      if (kv.first.size()<4 || kv.first[1] != ':' || kv.first.find("MP",2) != 2) continue;
-      auto nit = s.derived->multipathMovingCount.find(kv.first);
-      char sys = kv.first[0];
-      std::string combo = kv.first.substr(2);
-      std::string bands = combo.size()>=4 ? (bandAlias(sys,combo[2]) + "/" + bandAlias(sys,combo[3])) : "";
-      os << "  " << std::left << std::setw(4) << systemName(sys).substr(0,4)
-         << " " << std::setw(8) << combo << " " << std::setw(20) << bands << std::right
-         << " " << std::setw(8) << std::fixed << std::setprecision(4) << kv.second
-         << " " << std::setw(6) << (nit==s.derived->multipathMovingCount.end()?0:nit->second)
-         << " " << mpQuality(kv.second) << "\n";
-    }
-  }
   if (s.derived && s.derived->multipathEnabled) os << "Points in MP moving avg : 50\n";
   if (s.derived && s.derived->snrEnabled) {
-    const std::vector<std::string> bands = s.derived->ceqcExtensionEnabled
-      ? std::vector<std::string>{"1","2","5","6","7","8"}
-      : std::vector<std::string>{"1","2"};
+    const std::vector<std::string> bands = {"1", "2"};
     for (const std::string& band : bands) {
       auto it = s.derived->snrStats.find(band);
       if (it == s.derived->snrStats.end() || it->second.count == 0) continue;
@@ -582,27 +596,6 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
     os << "IOD or MP slips         :      0\n";
   }
   }
-  if (s.derived) {
-    auto printComputedTeqc=[&](const std::string& label,const std::string& key,int samplesOverride=-1){ int samples=samplesOverride>=0?samplesOverride:(s.derived->histogramSamples.count(key)?s.derived->histogramSamples.at(key):0); auto hit=s.derived->histograms.find(key); if(samples<=0 || hit==s.derived->histograms.end()) os << label << " skipped             : samples=0\n"; else os << label << " computed            : samples=" << samples << " bins=" << histogramText(hit->second) << "\n"; };
-    printComputedTeqc("ION","ion");
-    int mp1Samples=0, mp2Samples=0; auto m1=s.derived->multipathMovingCount.find("MP1"); if(m1!=s.derived->multipathMovingCount.end()) mp1Samples=m1->second; auto m2=s.derived->multipathMovingCount.find("MP2"); if(m2!=s.derived->multipathMovingCount.end()) mp2Samples=m2->second;
-    if(mp1Samples>0) os << "MP1 computed            : samples=" << mp1Samples << " rms_m=" << std::fixed << std::setprecision(3) << s.derived->mp1Meters << "\n"; else os << "MP1 skipped             : samples=0\n";
-    if(mp2Samples>0) os << "MP2 computed            : samples=" << mp2Samples << " rms_m=" << std::fixed << std::setprecision(3) << s.derived->mp2Meters << "\n"; else os << "MP2 skipped             : samples=0\n";
-    if(mp1Samples<=0 && mp2Samples<=0 && !s.derived->multipathSkipReason.empty()) os << "MP skip reason          : " << s.derived->multipathSkipReason << "\n";
-    if(s.derived->ceqcExtensionEnabled || s.derived->dataIndicatorsEnabled){ for(const auto& kv:s.derived->histogramSamples){ if(kv.first=="ion"||kv.first=="mp") continue; if(s.derived->histograms.find(kv.first)==s.derived->histograms.end()) os << "CEQC-ext histogram " << kv.first << " : skipped samples=" << kv.second << "\n"; } for(const auto& kv:s.derived->histograms){ if(kv.first=="ion"||kv.first=="mp") continue; os << "CEQC-ext histogram " << kv.first << " : " << histogramText(kv.second) << " samples=" << (s.derived->histogramSamples.count(kv.first)?s.derived->histogramSamples.at(kv.first):0) << "\n"; } }
-    for(const auto& w:s.derived->thresholdWarnings) os << "QC threshold warning    : " << w << "\n";
-    if((s.derived->everyEpochXYZ||s.derived->everyEpochGeodetic||s.derived->everyEpochDecimal) && !s.derived->epochPositions.empty()){
-      os << "Every-epoch position    : " << s.derived->epochPositions.size() << " epoch records\n";
-      size_t shown=0;
-      for(const auto& ep:s.derived->epochPositions){
-        if(shown++>=20){ os << "  ... truncated ...\n"; break; }
-        os << "  " << ep.time << " SV=" << ep.usedSVs << " " << ep.status;
-        if(ep.status=="OK") os << " XYZ=" << std::fixed << std::setprecision(3) << ep.x << "," << ep.y << "," << ep.z;
-        os << "\n";
-      }
-    }
-  }
-  if (s.ubx) os << "SFRBX messages          : " << std::setw(6) << s.ubx->sfrbxCount << "\n";
   if (s.firstEpoch && s.lastEpoch) {
     if (s.derived && s.derived->snrStats.count("1") && s.derived->snrStats.at("1").count) {
       os << "      first epoch    last epoch    sn1" << (s.derived->snrStats.count("2") ? "   sn2 " : " ") << "\n";
@@ -641,10 +634,11 @@ void printTeqcLikeQC(std::ostream& os, const ceqc::model::QCSummary& s) {
 } // namespace
 
 namespace ceqc::view {
-void printVersion(std::ostream& os){ os << "ceqc 0.0.1 C++21-cleanroom\n"; }
+void printVersion(std::ostream& os){ os << ceqc::CEQC_VERSION_STRING << "\n"; }
 void printHelp(std::ostream& os){ os << ceqcHelpText(); }
 void printIssues(std::ostream& os,const std::string& path,const std::vector<ceqc::model::ValidationIssue>& issues){ if(issues.empty()){os<<path<<": OK\n";return;} for(auto&i:issues)os<<path<<": "<<i.severity<<": "<<i.message<<"\n"; }
-void printQC(std::ostream& os,const ceqc::model::QCSummary& s,bool quiet,bool teqcCompat){ if(teqcCompat){ printTeqcLikeQC(os,s); return; } os<<"file: "<<s.sourcePath<<"\n"<<"rinex: "<<std::fixed<<std::setprecision(2)<<s.version<<" "<<toString(s.kind)<<"\n"; os<<"epochs: "<<s.epochCount<<"\n"; if(s.kind==ceqc::model::RinexKind::Obs){ os<<"obs-records: "<<s.observationRecords<<"\n"; os<<"obs-values: decoded="<<s.observationValues<<" missing="<<s.missingObservations<<"\n"; } if(s.kind==ceqc::model::RinexKind::Nav){ os<<"nav-records: "<<s.navigationRecords<<"\nnav-values: "<<s.navigationValues<<"\nnav-fields: "<<s.navigationFields<<"\n"; } if(s.firstEpoch) os<<"first: "<<ceqc::model::formatUTC(*s.firstEpoch)<<"\n"; if(s.lastEpoch) os<<"last: "<<ceqc::model::formatUTC(*s.lastEpoch)<<"\n"; if(s.estimatedIntervalS>0) os<<"interval: "<<std::setprecision(3)<<s.estimatedIntervalS<<"s\n"; if(!quiet){ os<<"systems:\n"; for(auto&kv:s.systemAppearance)os<<"  "<<kv.first<<": "<<kv.second<<"\n"; }
+void printQC(std::ostream& os,const ceqc::model::QCSummary& s,bool quiet,bool teqcCompat){ if(teqcCompat){ printTeqcLikeQC(os,s); return; } const bool showNativeAccounting=s.derived && (s.derived->dataIndicatorsEnabled || s.derived->ceqcExtensionEnabled); os<<"file: "<<s.sourcePath<<"\n"<<"rinex: "<<std::fixed<<std::setprecision(2)<<s.version<<" "<<toString(s.kind)<<"\n"; os<<"epochs: "<<s.epochCount<<"\n"; if(s.kind==ceqc::model::RinexKind::Obs){ os<<"obs-records: "<<s.observationRecords<<"\n"; const int emptySlots=s.observationBlankSlots+s.missingObservations; os<<"obs-values: decoded="<<s.observationValues<<" empty-slots="<<emptySlots; if(s.rtcm3 || s.ubx) os<<" decode-failed=0"; os<<"\n"; } if(s.kind==ceqc::model::RinexKind::Nav){ os<<"nav-records: "<<s.navigationRecords<<"\nnav-values: "<<s.navigationValues<<"\nnav-fields: "<<s.navigationFields<<"\n"; } if(s.firstEpoch) os<<"first: "<<ceqc::model::formatUTC(*s.firstEpoch)<<"\n"; if(s.lastEpoch) os<<"last: "<<ceqc::model::formatUTC(*s.lastEpoch)<<"\n"; if(s.estimatedIntervalS>0) os<<"interval: "<<std::setprecision(3)<<s.estimatedIntervalS<<"s\n"; if(!quiet){ os<<"systems:\n"; for(auto&kv:s.systemAppearance){ os<<"  "<<kv.first<<": "<<kv.second<<"\n"; } }
+  if(showNativeAccounting && s.kind==ceqc::model::RinexKind::Obs && (!s.systemObservationValues.empty() || s.observationBlankSlots>0)){ os<<"ceqc-ext obs-accounting:\n"; os<<"  decoded-values: "<<s.observationValues<<"\n"; if(s.observationBlankSlots>0) os<<"  blank-slots: "<<s.observationBlankSlots<<"\n"; for(auto&kv:s.systemAppearance){ os<<"  "<<kv.first<<": sv-records="<<kv.second; auto vi=s.systemObservationValues.find(kv.first); if(vi!=s.systemObservationValues.end()) os<<" decoded-values="<<vi->second; auto bi=s.systemBlankSlots.find(kv.first); if(bi!=s.systemBlankSlots.end() && bi->second>0) os<<" blank-slots="<<bi->second; os<<"\n"; } }
   if(s.derived){ os<<"qc-options:"; for(auto&o:s.derived->optionsActive)os<<" "<<o; os<<"\n"; os<<"epoch-svs: min="<<s.derived->epochSVMin<<" mean="<<std::setprecision(2)<<s.derived->epochSVMean<<" max="<<s.derived->epochSVMax<<"\n"; if(!s.derived->gapEvents.empty()) os<<"gaps: "<<s.derived->gapEvents.size()<<"\n"; if(s.derived->lliEnabled) os<<"lli-count: "<<s.derived->lliCount<<"\n"; if(s.derived->snrEnabled && !s.derived->snrStats.empty()){ bool anyCode=false; for(auto&kv:s.derived->snrStats) if(kv.first.find(':')!=std::string::npos){ anyCode=true; os<<"snr-summary "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(2)<<kv.second.mean<<" rms="<<kv.second.rms<<" low="<<kv.second.lowCount<<"\n"; } if(!anyCode) for(auto&kv:s.derived->snrStats) if(kv.first!="all") os<<"snr-summary "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(2)<<kv.second.mean<<" rms="<<kv.second.rms<<" low="<<kv.second.lowCount<<"\n"; } if(s.derived->pseudorangePhaseEnabled && !s.derived->pseudorangePhase.empty()) for(auto&kv:s.derived->pseudorangePhase) os<<"pseudorange-phase "<<kv.first<<": n="<<kv.second.count<<" mean="<<std::setprecision(3)<<kv.second.mean<<" rms="<<kv.second.rms<<"\n"; if(!s.derived->timeplot.empty()) os<<"qc-timeplot: "<<s.derived->timeplot<<"\n";
     if(s.derived->ceqcExtensionEnabled && !s.derived->obsTimeplot.empty()) os<<"ceqc-ext timeplot obs: |"<<s.derived->obsTimeplot<<"|\n";
     if(s.derived->ceqcExtensionEnabled && !s.derived->navTimeplot.empty()) os<<"ceqc-ext timeplot nav: |"<<s.derived->navTimeplot<<"|\n";
@@ -706,7 +700,7 @@ void printQC(std::ostream& os,const ceqc::model::QCSummary& s,bool quiet,bool te
         os<<"\n";
       }
     }
-    if(s.derived->dataIndicatorsEnabled){ os<<"data-completeness: complete="<<s.derived->dataCompleteness.completeRecords<<" partial="<<s.derived->dataCompleteness.partialRecords<<" missing_values="<<s.derived->dataCompleteness.missingValues<<"\n"; }
+    if(s.derived->dataIndicatorsEnabled){ os<<"data-completeness: complete="<<s.derived->dataCompleteness.completeRecords<<" partial="<<s.derived->dataCompleteness.partialRecords<<" empty_slots="<<(s.observationBlankSlots+s.missingObservations)<<" decode_failed=0\n"; }
     if(s.derived->yCodeEnabled){ os<<"y-code-summary: gps_y_code_observations="<<s.derived->dataCompleteness.yCodeObservations<<"\n"; }
     if(s.derived->riseSetEnabled && !s.derived->riseSetEvents.empty()){
       bool hasEph=false; for(const auto& ev:s.derived->riseSetEvents) if(ev.hasEphemeris || std::isfinite(ev.maxElevationDeg)) hasEph=true;

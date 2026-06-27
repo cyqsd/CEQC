@@ -443,13 +443,18 @@ void writeQCJson(std::ostream& os, const ceqc::model::QCSummary& s) {
   counts["epochs"] = s.epochCount;
   counts["observation_records"] = s.observationRecords;
   counts["observation_values_decoded"] = s.observationValues;
-  counts["observation_values_missing"] = s.missingObservations;
+  counts["observation_empty_slots"] = s.observationBlankSlots + s.missingObservations;
+  counts["observation_decode_failed"] = 0;
+  counts["observation_slots_total"] = s.observationValues + s.missingObservations + s.observationBlankSlots;
   counts["navigation_records"] = s.navigationRecords;
   counts["navigation_values"] = s.navigationValues;
   counts["navigation_fields"] = s.navigationFields;
   counts["broadcast_ephemerides"] = s.broadcastEphemerides;
   counts["meteorological_records"] = s.meteorologicalRecords;
   counts["systems"] = mapStringInt(s.systemAppearance);
+  counts["system_observation_records"] = mapStringInt(s.systemAppearance);
+  counts["system_observation_values"] = mapStringInt(s.systemObservationValues);
+  counts["system_blank_slots"] = mapStringInt(s.systemBlankSlots);
   counts["satellites"] = mapStringInt(s.satelliteAppearance);
   counts["navigation_satellites"] = mapStringInt(s.navigationSatelliteAppearance);
   root["counts"] = counts;
@@ -462,9 +467,18 @@ void writeQCJson(std::ostream& os, const ceqc::model::QCSummary& s) {
     r["bad_crc"] = s.rtcm3->badCRCCount;
     r["bad_length"] = s.rtcm3->badLengthCount;
     r["resync_count"] = s.rtcm3->resyncCount;
+    r["decode_failed_messages"] = s.rtcm3->badCRCCount + s.rtcm3->badLengthCount;
+    json decodeFailedByReason = json::object();
+    decodeFailedByReason["bad_crc"] = s.rtcm3->badCRCCount;
+    decodeFailedByReason["bad_length"] = s.rtcm3->badLengthCount;
+    decodeFailedByReason["payload_decode_error"] = 0;
+    r["decode_failed_by_reason"] = decodeFailedByReason;
     r["epochs"] = s.rtcm3->epochCount;
     r["satellite_observations"] = s.rtcm3->observationCount;
     r["observation_values"] = s.rtcm3->observationValueCount;
+    json messageCounts = json::object();
+    for (const auto& kv : s.rtcm3->messageCounts) messageCounts[std::to_string(kv.first)] = kv.second;
+    r["message_counts"] = messageCounts;
     root["rtcm3"] = r;
   }
   if (s.ubx) {
@@ -473,6 +487,7 @@ void writeQCJson(std::ostream& os, const ceqc::model::QCSummary& s) {
     u["frames_total"] = s.ubx->frameCount;
     u["frames_good"] = s.ubx->goodFrameCount;
     u["bad_checksum"] = s.ubx->badChecksumCount;
+    u["decode_failed_messages"] = s.ubx->badChecksumCount;
     u["rawx_messages"] = s.ubx->rawxCount;
     u["sfrbx_messages"] = s.ubx->sfrbxCount;
     u["epochs"] = s.ubx->epochCount;

@@ -90,7 +90,10 @@ struct QCOptions {
 };
 struct QCSummary {
   std::string sourcePath; std::vector<std::string> navInputFiles; std::map<std::string,int> navigationSatelliteAppearance; std::string markerName; std::string markerNumber; std::string receiverNumber; std::string receiverType; std::string receiverVersion; std::string antennaNumber; std::string antennaType; double version=0; RinexKind kind=RinexKind::Unknown; int epochCount=0, observationRecords=0, observationValues=0, missingObservations=0;
+  // Empty RINEX observation slots introduced by the per-system OBS TYPES union.
+  // For raw RTCM3/UBX QC these are unobserved signal cells, not decoder failures.
+  int observationBlankSlots=0;
   int navigationRecords=0, navigationValues=0, navigationFields=0, broadcastEphemerides=0, meteorologicalRecords=0, meteorologicalValues=0; std::optional<TimePoint> firstEpoch,lastEpoch; double estimatedIntervalS=0;
-  std::map<std::string,int> satelliteAppearance, systemAppearance; std::vector<ValidationIssue> headerIssues; std::vector<std::string> warnings; std::optional<ResidualStats> residuals; std::optional<QCDerivedSummary> derived; std::optional<RTCM3Summary> rtcm3; std::optional<UBXSummary> ubx;
+  std::map<std::string,int> satelliteAppearance, systemAppearance, systemObservationValues, systemBlankSlots; std::vector<ValidationIssue> headerIssues; std::vector<std::string> warnings; std::optional<ResidualStats> residuals; std::optional<QCDerivedSummary> derived; std::optional<RTCM3Summary> rtcm3; std::optional<UBXSummary> ubx;
 };
 }
